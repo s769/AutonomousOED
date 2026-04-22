@@ -1,4 +1,6 @@
 # AutonomousOED (SC26 AD/AE Appendix)
+[![DOI](https://zenodo.org/badge/1218415652.svg)](https://doi.org/10.5281/zenodo.19701232)
+
 
 This repository contains the scripts used to reproduce the performance benchmarks and (with access to the large CSZ dataset) the greedy sensor-selection application described in the SC26 paper.
 
