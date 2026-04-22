@@ -1,8 +1,8 @@
-# AutonomousOED (SC26 AD/AE Appendix)
+# AutonomousOED
 [![DOI](https://zenodo.org/badge/1218415652.svg)](https://doi.org/10.5281/zenodo.19701232)
 
 
-This repository contains the scripts used to reproduce the performance benchmarks and (with access to the large CSZ dataset) the greedy sensor-selection application described in the SC26 paper.
+This repository contains the scripts used to reproduce the performance benchmarks and (with access to the large CSZ dataset) the greedy sensor-selection application described in paper: "Sensor Placement for Tsunami Early Warning via Large-Scale Bayesian Optimal Experimental Design."
 
 ## Repository layout
 
@@ -90,4 +90,4 @@ python oed_hist.py \
 ## Notes for artifact packaging
 
 - Large datasets (e.g., the CSZ \(K\) matrix) are intentionally **not** included in this repository.
-- All scripts accept file paths via CLI arguments; there are no site-specific absolute paths in the code.
+- All scripts accept file paths via CLI arguments.
