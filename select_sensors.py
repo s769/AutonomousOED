@@ -7,38 +7,18 @@ import argparse
 import math
 import os
 
-
-def load_block_into_tensor(
-    h5_dset,
-    Nt,
-    row_idx,
-    col_idx,
-    destination_tensor,
-    dest_row_start,
-    dest_col_start,
-    dtype,
-):
-    block_start_row, block_start_col = row_idx * Nt, col_idx * Nt
-    block_numpy = h5_dset[
-        block_start_row : block_start_row + Nt, block_start_col : block_start_col + Nt
-    ]
-    destination_tensor[
-        dest_row_start : dest_row_start + Nt, dest_col_start : dest_col_start + Nt
-    ] = torch.from_numpy(block_numpy).to(dtype)
+from h5_batch_io import build_si_read_plan, load_ii_block, load_si_column_blocks
+from pipelined_loader import PipelinedLoader
 
 
-def fill_column_buffer(h5_dset, Nt, S_indices, candidate_idx, buffer_tensor, dtype):
-    for i, s_row in enumerate(S_indices):
-        load_block_into_tensor(
-            h5_dset,
-            Nt,
-            row_idx=s_row,
-            col_idx=candidate_idx,
-            destination_tensor=buffer_tensor,
-            dest_row_start=i * Nt,
-            dest_col_start=0,
-            dtype=dtype,
-        )
+def make_si_read_context(s_indices, nt, torch_h5_dtype):
+    plan = build_si_read_plan(np.asarray(s_indices), nt)
+    max_si_rows = max(
+        (entry["h5_row_end"] - entry["h5_row_start"] for entry in plan),
+        default=nt,
+    )
+    slab = torch.empty((max_si_rows, nt), dtype=torch_h5_dtype).pin_memory()
+    return plan, slab.numpy()
 
 
 def build_k_submatrix_from_h5(h5_dset, Nt, S_indices, device, r_sq, dtype):
@@ -225,33 +205,54 @@ def main():
                 torch.tensor([0], dtype=torch.int32, device=device) for _ in range(2)
             ]
 
+            si_read_plan = []
+            si_slab_np = None
+            if k > 0:
+                si_read_plan, si_slab_np = make_si_read_context(
+                    S_indices, Nt, torch_h5_dtype
+                )
+
             def load_candidate_to_buffer(c_idx, buf_idx):
-                i = valid_candidates[c_idx]
-                col_start = i * Nt
+                cand_idx = valid_candidates[c_idx]
+                col_start = cand_idx * Nt
                 col_end = col_start + Nt
 
                 np_Si_pinned_view = pinned_Si[buf_idx].numpy()
                 np_ii_pinned_view = pinned_ii[buf_idx].numpy()
 
                 if k > 0:
-                    for idx, s_row in enumerate(S_indices):
-                        row_start = s_row * Nt
-                        row_end = row_start + Nt
-                        np_Si_pinned_view[idx * Nt : (idx + 1) * Nt, :] = h5_dset[
-                            row_start:row_end, col_start:col_end
-                        ]
+                    load_si_column_blocks(
+                        h5_dset,
+                        col_start,
+                        col_end,
+                        Nt,
+                        np_Si_pinned_view[: k * Nt, :],
+                        si_read_plan,
+                        slab_view=si_slab_np,
+                    )
 
-                np_ii_pinned_view[:, :] = h5_dset[col_start:col_end, col_start:col_end]
+                load_ii_block(h5_dset, col_start, col_end, np_ii_pinned_view)
 
-            # ------------------------------------------------
-            # PRE-FILL PIPELINE
-            # ------------------------------------------------
+            loader = PipelinedLoader(
+                load_candidate_to_buffer,
+                cuda_device=device if device.type == "cuda" else None,
+            )
+
             if actual_evals > 0:
-                load_candidate_to_buffer(0, 0)
+                loader.load_sync(0, buf_idx=0)
 
             for c, i in enumerate(valid_candidates):
                 curr_b = c % 2
                 next_b = (c + 1) % 2
+
+                if c > 0:
+                    loader.wait()
+
+                if c + 1 < actual_evals:
+                    before_load = None
+                    if device.type == "cuda":
+                        before_load = gpu_done_events[next_b].synchronize
+                    loader.start_async(c + 1, buf_idx=next_b, before_load=before_load)
 
                 # Slice buffers to current active K size
                 curr_Si_raw = K_Si_gpu_raw[curr_b][: k * Nt, :] if k > 0 else None
@@ -315,15 +316,9 @@ def main():
 
                     gpu_done_events[curr_b].record(streams[curr_b])
 
-                # ------------------------------------------------
-                # OVERLAPPED CPU I/O
-                # ------------------------------------------------
-                if c + 1 < actual_evals:
-                    gpu_done_events[next_b].synchronize()
-                    load_candidate_to_buffer(c + 1, next_b)
-
-            # Flush pipeline before communication and score reduction
-            torch.cuda.synchronize()
+            loader.wait()
+            if device.type == "cuda":
+                torch.cuda.synchronize()
 
             # Reduce the two stream trackers to find local best
             score_0, cand_0 = (
@@ -381,17 +376,14 @@ def main():
             current_log_det += new_gain
 
             # --- ONE-TIME SYNCHRONOUS L_S UPDATE ---
+            col_start = best_candidate_idx * Nt
+            col_end = col_start + Nt
+
+            pinned_ii_new = torch.empty((Nt, Nt), dtype=torch_h5_dtype).pin_memory()
+            load_ii_block(h5_dset, col_start, col_end, pinned_ii_new.numpy())
+
             K_ii_new = torch.empty((Nt, Nt), dtype=compute_dtype, device=device)
-            load_block_into_tensor(
-                h5_dset,
-                Nt,
-                best_candidate_idx,
-                best_candidate_idx,
-                K_ii_new,
-                0,
-                0,
-                compute_dtype,
-            )
+            K_ii_new.copy_(pinned_ii_new, non_blocking=device.type == "cuda")
             K_ii_new.mul_(args.r_sq).diagonal().add_(1.0)
 
             if k == 0:
@@ -399,15 +391,22 @@ def main():
                 L_S_global[0:Nt, 0:Nt] = K_ii_new
                 L_S = L_S_global[0:Nt, 0:Nt]
             else:
-                K_Si_new = torch.empty((k * Nt, Nt), dtype=compute_dtype, device=device)
-                fill_column_buffer(
-                    h5_dset,
-                    Nt,
-                    S_indices[:-1],
-                    best_candidate_idx,
-                    K_Si_new,
-                    compute_dtype,
+                update_plan, update_slab_np = make_si_read_context(
+                    S_indices[:-1], Nt, torch_h5_dtype
                 )
+                pinned_col = torch.empty((k * Nt, Nt), dtype=torch_h5_dtype).pin_memory()
+                load_si_column_blocks(
+                    h5_dset,
+                    col_start,
+                    col_end,
+                    Nt,
+                    pinned_col.numpy(),
+                    update_plan,
+                    slab_view=update_slab_np,
+                )
+
+                K_Si_new = torch.empty((k * Nt, Nt), dtype=compute_dtype, device=device)
+                K_Si_new.copy_(pinned_col, non_blocking=device.type == "cuda")
                 K_Si_new.mul_(args.r_sq)
 
                 # Strict In-Place Math for Synchronous Update

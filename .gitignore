@@ -16,6 +16,5 @@ __pycache__/
 
 *.h5
 *.hdf5
-*.zarr/
 
-scaling_results/
+*.json

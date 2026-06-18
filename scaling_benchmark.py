@@ -9,6 +9,9 @@ import h5py
 import math
 from tqdm import tqdm
 
+from h5_batch_io import build_si_read_plan, load_ii_block, load_si_column_blocks
+from pipelined_loader import PipelinedLoader
+
 
 def cleanup():
     gc.collect()
@@ -118,6 +121,18 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
 
     np.random.seed(seed_s)
     mock_S_indices = np.random.choice(Nd, k, replace=False)
+    si_read_plan = build_si_read_plan(mock_S_indices, Nt)
+    max_si_rows = max(
+        (entry["h5_row_end"] - entry["h5_row_start"] for entry in si_read_plan),
+        default=Nt,
+    )
+    si_slab = torch.empty((max_si_rows, Nt), dtype=torch_h5_dtype).pin_memory()
+    si_slab_np = si_slab.numpy()
+    if rank == 0:
+        print(
+            f"Batched HDF5 reads: {len(si_read_plan)} hyperslabs for {k} sensor rows "
+            f"(was {k} per candidate)"
+        )
     valid_pool = np.setdiff1d(np.arange(Nd), mock_S_indices)
 
     np.random.seed(seed_candidates)
@@ -136,14 +151,16 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
         np_Si_pinned_view = pinned_Si[buf_idx].numpy()
         np_ii_pinned_view = pinned_ii[buf_idx].numpy()
 
-        for i, s_row in enumerate(mock_S_indices):
-            row_start = s_row * Nt
-            row_end = row_start + Nt
-            np_Si_pinned_view[i * Nt : (i + 1) * Nt, :] = h5_dset[
-                row_start:row_end, col_start:col_end
-            ]
-
-        np_ii_pinned_view[:, :] = h5_dset[col_start:col_end, col_start:col_end]
+        load_si_column_blocks(
+            h5_dset,
+            col_start,
+            col_end,
+            Nt,
+            np_Si_pinned_view,
+            si_read_plan,
+            slab_view=si_slab_np,
+        )
+        load_ii_block(h5_dset, col_start, col_end, np_ii_pinned_view)
 
         return MPI.Wtime() - t0
 
@@ -165,12 +182,10 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
         ]
 
         t_wall_start = MPI.Wtime()
+        loader = PipelinedLoader(load_candidate_to_buffer, cuda_device=device)
 
-        # Fill the first pipeline buffer
         if actual_evals > 0:
-            nvtx.range_push("Lustre_IO_Read")
-            local_io_time += load_candidate_to_buffer(0, buf_idx=0)
-            nvtx.range_pop()
+            loader.load_sync(0, buf_idx=0)
 
         for c in tqdm(range(actual_evals), disable=rank != 0):
             curr_b = c % 2
@@ -178,13 +193,29 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
 
             nvtx.range_push(f"Candidate_Loop_{c}")
 
+            if c > 0:
+                loader.wait()
+
+            if c >= 2:
+                done_b = (c - 2) % 2
+                local_compute_time += (
+                    start_events[done_b].elapsed_time(end_events[done_b]) / 1000.0
+                )
+
+            # Prefetch on the I/O thread; GPU-buffer sync also runs there.
+            if c + 1 < actual_evals:
+                loader.start_async(
+                    c + 1,
+                    buf_idx=next_b,
+                    before_load=gpu_done_events[next_b].synchronize,
+                )
+
             # ------------------------------------------------
             # 1. ASYNC GPU PIPELINE (ISOLATED STREAM)
             # ------------------------------------------------
             with torch.cuda.stream(streams[curr_b]):
                 nvtx.range_push("GPU_Dispatch")
 
-                # H2D Transfers enqueue on this specific stream
                 K_Si_gpu_raw[curr_b].copy_(pinned_Si[curr_b], non_blocking=True)
                 K_ii_gpu_raw[curr_b].copy_(pinned_ii[curr_b], non_blocking=True)
 
@@ -194,7 +225,6 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
 
                 start_events[curr_b].record(streams[curr_b])
 
-                # Math: Strict In-Place Operations
                 K_Si_gpu_math[curr_b].mul_(r_sq)
                 torch.linalg.solve_triangular(
                     L_S, K_Si_gpu_math[curr_b], upper=False, out=K_Si_gpu_math[curr_b]
@@ -222,50 +252,27 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
                 gpu_done_events[curr_b].record(streams[curr_b])
                 nvtx.range_pop()
 
-            # ------------------------------------------------
-            # 2. OVERLAPPED CPU I/O
-            # ------------------------------------------------
-            if c + 1 < actual_evals:
-                # CPU Wait: Ensure the *next* buffer's stream has finished its prior
-                # iteration before the CPU overwrites its pinned memory.
-                nvtx.range_push("CPU_Wait_For_GPU")
-                gpu_done_events[next_b].synchronize()
-                nvtx.range_pop()
-
-                if c >= 1:
-                    local_compute_time += (
-                        start_events[next_b].elapsed_time(end_events[next_b]) / 1000.0
-                    )
-
-                nvtx.range_push("Lustre_IO_Read")
-                local_io_time += load_candidate_to_buffer(c + 1, buf_idx=next_b)
-                nvtx.range_pop()
-
             nvtx.range_pop()
 
-        # Pipeline Drain: Sync all streams before final timing collection
+        loader.wait()
         torch.cuda.synchronize()
+
+        if actual_evals >= 1:
+            last_b = (actual_evals - 1) % 2
+            local_compute_time += (
+                start_events[last_b].elapsed_time(end_events[last_b]) / 1000.0
+            )
+        if actual_evals >= 2:
+            prev_b = (actual_evals - 2) % 2
+            local_compute_time += (
+                start_events[prev_b].elapsed_time(end_events[prev_b]) / 1000.0
+            )
 
         local_best_score = max(
             local_best_score_gpu[0].item(), local_best_score_gpu[1].item()
         )
 
-        # Collect final timings that fell out of the loop
-        if actual_evals >= 1:
-            local_compute_time += (
-                start_events[(actual_evals - 1) % 2].elapsed_time(
-                    end_events[(actual_evals - 1) % 2]
-                )
-                / 1000.0
-            )
-        if actual_evals >= 2:
-            local_compute_time += (
-                start_events[(actual_evals - 2) % 2].elapsed_time(
-                    end_events[(actual_evals - 2) % 2]
-                )
-                / 1000.0
-            )
-
+        local_io_time = loader.io_time
         local_wall_time = MPI.Wtime() - t_wall_start
 
         comm.Barrier()

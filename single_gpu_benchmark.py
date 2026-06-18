@@ -230,13 +230,9 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                     vals["m_ni"] = torch.cuda.max_memory_allocated() / (1024**3)
 
                     # Timing Loop (Zero allocations inside).
-                    # FIX: start_event must be recorded BEFORE assembly, not after.
-                    # N-OOP times assembly + Cholesky; N-IP must do the same so the
-                    # comparison is apples-to-apples. The in-place Cholesky overwrites
-                    # K_aug, so the assembly must run every iteration anyway.
                     t_accum = 0.0
                     for _ in range(runs):
-                        start_event.record()  # <-- moved before assembly (was after)
+                        start_event.record()
                         torch.mm(L_S, L_S.T, out=K_aug[:current_size, :current_size])
                         K_aug[:current_size, current_size:] = K_Si
                         K_aug[current_size:, :current_size] = K_Si.T
@@ -311,24 +307,14 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                     )
 
                     dummy_info = torch.empty((), dtype=torch.int32, device=device)
-                    # Clone inputs since they will be irreversibly destroyed
                     K_Si_tmp = K_Si.clone()
                     K_ii_tmp = K_ii.clone()
 
                     # Peak Memory Run
-                    # 1. Overwrite K_Si_tmp directly
                     torch.linalg.solve_triangular(
                         L_S, K_Si_tmp, upper=False, out=K_Si_tmp
                     )
-                    # 2. Overwrite K_ii_tmp directly.
-                    # FIX: use addmm_ (the explicit in-place method) instead of
-                    # addmm(..., out=K_ii_tmp) where K_ii_tmp is also the `input`
-                    # argument. Passing the same tensor as both `input` and `out` in
-                    # addmm is not formally supported by cuBLAS and can produce
-                    # incorrect results. addmm_ is the correct API for in-place
-                    # beta*self + alpha*mat1@mat2 with self as both accumulator and output.
                     K_ii_tmp.addmm_(K_Si_tmp.T, K_Si_tmp, alpha=-1.0, beta=1.0)
-                    # 3. True Aliased In-Place Cholesky
                     torch.linalg.cholesky_ex(K_ii_tmp, out=(K_ii_tmp, dummy_info))
 
                     vals["m_si"] = torch.cuda.max_memory_allocated() / (1024**3)
@@ -336,7 +322,6 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                     # Timing Loop (Zero allocations inside)
                     t_accum = 0.0
                     for _ in range(runs):
-                        # Reset buffers OUTSIDE the stopwatch
                         K_Si_tmp.copy_(K_Si)
                         K_ii_tmp.copy_(K_ii)
 

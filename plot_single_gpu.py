@@ -8,9 +8,9 @@ import seaborn as sns
 # ==========================================
 # 1. FILE CONFIGURATION
 # ==========================================
-FILE_A100 = "test_new_a100.csv"
-FILE_MI250X = "test_new_mi250x.csv"
-FILE_GH200 = "test_new_gh200.csv"
+FILE_A100 = "single_gpu_results_a100.csv"
+FILE_MI250X = "single_gpu_results_mi250x.csv"
+FILE_GH200 = "single_gpu_results_gh200.csv"
 
 
 def load_data(filename):
