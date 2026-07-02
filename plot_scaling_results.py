@@ -14,7 +14,7 @@ plt.rcParams["axes.labelweight"] = "bold"
 plt.rcParams["axes.titleweight"] = "bold"
 
 
-def load_data(filename, ranks_per_node, max_nodes=128, x_units="nodes"):
+def load_data(filename, ranks_per_node, max_nodes=256, x_units="nodes"):
     """Loads data and converts ranks to either Nodes or GPUs."""
     if not os.path.isfile(filename):
         print(f"Warning: {filename} not found.")
@@ -215,7 +215,7 @@ def plot_combined_scaling(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--annotate", action="store_true")
-    parser.add_argument("--x_units", choices=["nodes", "gpus"], default="nodes")
+    parser.add_argument("--x_units", choices=["nodes", "gpus"], default="gpus")
     args = parser.parse_args()
 
     x_label = "Number of Compute Nodes" if args.x_units == "nodes" else "Number of GPUs"

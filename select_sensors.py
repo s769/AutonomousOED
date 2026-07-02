@@ -7,6 +7,7 @@ import argparse
 import math
 import os
 
+from cuda_device import resolve_local_rank, resolve_torch_device
 from h5_batch_io import build_si_read_plan, load_ii_block, load_si_column_blocks
 from pipelined_loader import PipelinedLoader
 
@@ -68,12 +69,15 @@ def main():
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        device_id = rank % torch.cuda.device_count()
-        torch.cuda.set_device(device_id)
-        device = torch.device(f"cuda:{device_id}")
-    else:
-        device = torch.device("cpu")
+    local_rank = resolve_local_rank(rank)
+    device = resolve_torch_device(local_rank=local_rank, mpi_rank=rank)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    elif rank == 0 and torch.cuda.is_available():
+        print(
+            "Warning: CUDA is available but no GPU is accessible to this process. "
+            "Launch with srun inside your GPU allocation."
+        )
 
     torch.set_grad_enabled(False)
     compute_dtype = torch.float64 if args.precision == "double" else torch.float32
@@ -148,14 +152,21 @@ def main():
     dummy_info = [torch.empty((), dtype=torch.int32, device=device) for _ in range(2)]
 
     # Explicit CUDA streams for overlap
-    streams = [torch.cuda.Stream(device=device) for _ in range(2)]
-
-    gpu_done_events = [torch.cuda.Event() for _ in range(2)]
-    for e in gpu_done_events:
-        e.record(torch.cuda.default_stream)
+    streams = []
+    gpu_done_events = []
+    if device.type == "cuda":
+        streams = [torch.cuda.Stream(device=device) for _ in range(2)]
+        gpu_done_events = [torch.cuda.Event() for _ in range(2)]
+        for e, stream in zip(gpu_done_events, streams):
+            e.record(stream)
 
     if rank == 0:
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
         print(f"--- Low-Memory Pipelined Selection (Rank 0 on {device}) ---")
+        print(
+            f"MPI size={size}, local_rank={local_rank}, "
+            f"CUDA_VISIBLE_DEVICES={cuda_visible}"
+        )
         if args.restart_from:
             try:
                 loaded = np.loadtxt(args.restart_from)

@@ -4,10 +4,11 @@ import numpy as np
 import argparse
 import matplotlib.pyplot as plt
 import os
-import re
 from mpi4py import MPI
 from tqdm import tqdm
 import seaborn as sns
+
+from cuda_device import resolve_local_rank, resolve_torch_device
 
 # --- Standardized Styling ---
 sns.set_context("paper", font_scale=1.3)
@@ -159,6 +160,7 @@ def pre_screen_sensors(h5_k, Nt, indices, device, dtype):
     return valid_sensors
 
 
+
 def _append_checkpoint_line(path, value):
     with open(path, "a") as f:
         np.savetxt(f, [[value]], fmt="%.6e")
@@ -194,17 +196,9 @@ class RankCheckpointMerger:
             self.offsets[rank] = 0
 
 
-def get_truncated_config(filepath, budget):
-    data = np.loadtxt(filepath)[:].astype(float)
-    indices = data[:, 0].astype(int)
-    if len(indices) < budget:
-        print(f"Warning: File {filepath} only has {len(indices)} sensors. Budget is {budget}.")
-        return indices.tolist(), data[-1, 1]
-    return indices[:budget].tolist(), data[budget - 1, 1]
-
 
 def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
-    print("Evaluating optimal configuration and generating plot...")
+    print("Generating plot...")
 
     if not os.path.exists(checkpoint_file):
         print(f"Error: {checkpoint_file} not found.")
@@ -274,8 +268,9 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                 linewidth=1.5,
                 zorder=5,
             )
+            x_mid_mean = 0.5 * (sample_mean + optimal_value)
             ax.text(
-                0.5 * (sample_mean + optimal_value),
+                x_mid_mean,
                 line_y_mean,
                 f"{sign}{n_sigma:.2f}$\\sigma$",
                 ha="center",
@@ -283,6 +278,16 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                 fontsize=10,
                 color="black",
                 fontweight="bold",
+            )
+            ax.annotate(
+                "to distribution mean",
+                xy=(x_mid_mean, line_y_mean),
+                xytext=(0, -3),  # spacing below line (points); more negative = further down
+                textcoords="offset points",
+                ha="center",
+                va="top",
+                fontsize=8,
+                color="black",
             )
 
             sample_max = np.max(valid_reg)
@@ -298,8 +303,9 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                     linewidth=1.5,
                     zorder=5,
                 )
+                x_mid_max = 0.5 * (sample_max + optimal_value)
                 ax.text(
-                    0.5 * (sample_max + optimal_value),
+                    x_mid_max,
                     line_y_max,
                     f"{sign_max}{n_sigma_max:.2f}$\\sigma$",
                     ha="center",
@@ -307,6 +313,16 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                     fontsize=10,
                     color="black",
                     fontweight="bold",
+                )
+                ax.annotate(
+                    "to distribution tail",
+                    xy=(x_mid_max, line_y_max),
+                    xytext=(0, -3),  # spacing below line (points); more negative = further down
+                    textcoords="offset points",
+                    ha="center",
+                    va="top",
+                    fontsize=8,
+                    color="black",
                 )
     ax.grid(True, alpha=0.3)
 
@@ -333,32 +349,25 @@ def main():
     parser.add_argument("--plot_only", action="store_true", help="Skip computation, just plot existing checkpoint file.")
     parser.add_argument("--no_plot", action="store_true", help="Skip plotting at the end.")
     parser.add_argument("--uniform_value", type=float, required=False, help="Uniform grid value of the D-optimal objective.")
-
     args = parser.parse_args()
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
 
-    if torch.cuda.is_available() and torch.cuda.device_count() > 0:
-        num_gpus = torch.cuda.device_count()
-        local_rank = int(
-            os.environ.get(
-                "SLURM_LOCALID", os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", rank)
-            )
-        )
-        device_id = local_rank % num_gpus
-        torch.cuda.set_device(device_id)
-        device = torch.device(f"cuda:{device_id}")
-    else:
-        device = torch.device("cpu")
+    local_rank = resolve_local_rank(rank)
+    device = resolve_torch_device(local_rank=local_rank, mpi_rank=rank)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     torch.set_grad_enabled(False)
     compute_dtype = torch.float64 if args.precision == "double" else torch.float32
 
     if args.plot_only:
         if rank == 0:
-            plot_histogram(args.checkpoint_file, args.optimal_value, args.uniform_value, args.budget, args)
+            plot_histogram(
+                args.checkpoint_file, args.optimal_value, args.uniform_value, args.budget, args
+            )
         return
     # --- HDF5 POSIX I/O Initialization ---
     try:
@@ -434,8 +443,8 @@ def main():
                     if rank == 0:
                         checkpoint_merger.merge_new()
                     break
-                else:
-                    local_cornered_retries += 1
+                local_cornered_retries += 1
+                if rank == 0:
                     print(f"[Retry] Rank {rank}: Cornered! Restarting configuration buildup...")
 
         all_results = comm.gather(local_results, root=0)
@@ -454,9 +463,11 @@ def main():
                 print("=" * 40 + "\n")
 
             if not args.no_plot:
-                if not args.optimal_value:
+                if args.optimal_value is None:
                     raise ValueError("--optimal_value is required unless --no_plot is set.")
-                plot_histogram(args.checkpoint_file, args.optimal_value, args.budget, args)
+                plot_histogram(
+                    args.checkpoint_file, args.optimal_value, args.uniform_value, args.budget, args
+                )
             
     finally:
         if 'h5_file_K' in locals():

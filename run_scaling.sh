@@ -71,7 +71,7 @@ for (( ranks=START_RANKS; ranks<=MAX_RANKS; ranks*=2 )); do
     fi
     srun -N "$nodes" -n "$ranks" -u $EXTRA_SRUN python scaling_benchmark.py \
         --h5_path "$H5_PATH" \
-        --file "$OUTDIR/strong_scaling.csv" \
+        --file "$OUTDIR/pm_strong_scaling.csv" \
         --total_candidates "$STRONG_TOTAL" \
         --runs "$RUNS" \
         --max_evals 0
@@ -84,6 +84,7 @@ done
 # ==========================================
 
 echo "--- Running Weak Scaling ---"
+
 for (( ranks=START_RANKS; ranks<=MAX_RANKS; ranks*=2 )); do
     echo "Running with $ranks ranks..."
     total_cand=$(( WEAK_PER_RANK * ranks ))
@@ -93,7 +94,7 @@ for (( ranks=START_RANKS; ranks<=MAX_RANKS; ranks*=2 )); do
     fi
     srun -N "$nodes" -n "$ranks" -u $EXTRA_SRUN python scaling_benchmark.py \
         --h5_path "$H5_PATH" \
-        --file "$OUTDIR/weak_scaling.csv" \
+        --file "$OUTDIR/pm_weak_scaling.csv" \
         --total_candidates "$total_cand" \
         --runs "$RUNS"
 done
