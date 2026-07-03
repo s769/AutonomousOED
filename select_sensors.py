@@ -61,7 +61,7 @@ def main():
     parser.add_argument("--checkpoint_file", type=str, default="checkpoint.txt")
     parser.add_argument("--restart_from", type=str, default=None)
     parser.add_argument(
-        "--precision", type=str, choices=["single", "double"], default="double"
+        "--precision", type=str, choices=["single", "double"], default="single"
     )
     args = parser.parse_args()
 
