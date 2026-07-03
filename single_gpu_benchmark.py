@@ -177,15 +177,13 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
 
                     vals["m_no"] = torch.cuda.max_memory_allocated() / (1024**3)
 
-                    # Timing Loop (Zero allocations inside)
+                    # Timing Loop: time only the Cholesky. K_S is constant across
+                    # candidates within a greedy step (formed once, above), and the
+                    # OOP factorization writes to a separate buffer, so K_aug is
+                    # preserved and re-factored directly each run.
                     t_accum = 0.0
                     for _ in range(runs):
                         start_event.record()
-                        torch.mm(L_S, L_S.T, out=K_S)
-                        K_aug[:current_size, :current_size] = K_S
-                        K_aug[:current_size, current_size:] = K_Si
-                        K_aug[current_size:, :current_size] = K_Si.T
-                        K_aug[current_size:, current_size:] = K_ii
                         torch.linalg.cholesky_ex(
                             K_aug, check_errors=False, out=(dummy_L, dummy_info)
                         )
@@ -229,14 +227,19 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
 
                     vals["m_ni"] = torch.cuda.max_memory_allocated() / (1024**3)
 
-                    # Timing Loop (Zero allocations inside).
+                    # Timing Loop: time only the Cholesky. The aliased in-place
+                    # factorization overwrites K_aug, so it is rebuilt before each
+                    # run OUTSIDE the timed region (the GEMM/assembly is not timed).
                     t_accum = 0.0
                     for _ in range(runs):
-                        start_event.record()
+                        # Restore K_aug (destroyed by previous in-place factor); untimed.
                         torch.mm(L_S, L_S.T, out=K_aug[:current_size, :current_size])
                         K_aug[:current_size, current_size:] = K_Si
                         K_aug[current_size:, :current_size] = K_Si.T
                         K_aug[current_size:, current_size:] = K_ii
+                        torch.cuda.synchronize()
+
+                        start_event.record()
                         torch.linalg.cholesky_ex(
                             K_aug, check_errors=False, out=(K_aug, dummy_info)
                         )
