@@ -56,43 +56,52 @@ def build_k_submatrix(h5_dset, Nt, S_indices, device, dtype, r_sq=1.0):
     return K_S
 
 
+def uniform_subsample_indices(n_total, n_select):
+    """Pick n_select evenly spaced indices from [0, n_total - 1].
+
+    When n_total divides n_select evenly, this uses an exact stride (e.g. 6 of 12
+    -> every other column: 0, 2, 4, 6, 8, 10). Otherwise falls back to rounded
+    linspace over the endpoints.
+    """
+    if n_select <= 0:
+        return np.array([], dtype=int)
+    if n_select >= n_total:
+        return np.arange(n_total, dtype=int)
+    if n_select == 1:
+        return np.array([(n_total - 1) // 2], dtype=int)
+    if n_total % n_select == 0:
+        stride = n_total // n_select
+        return np.arange(0, n_total, stride, dtype=int)[:n_select]
+    return np.round(np.linspace(0, n_total - 1, n_select)).astype(int)
+
+
+def pick_center_fill_sensors(unselected, add_count, n_lon, n_lat):
+    """Pick unselected sensors closest to the grid interior (away from edges)."""
+    lon_c = (n_lon - 1) / 2.0
+    lat_c = (n_lat - 1) / 2.0
+
+    def placement_score(idx):
+        lon, lat = idx // n_lat, idx % n_lat
+        edge_penalty = 0
+        if lon == 0 or lon == n_lon - 1:
+            edge_penalty += 100
+        if lat == 0 or lat == n_lat - 1:
+            edge_penalty += 100
+        dist = (lon - lon_c) ** 2 + (lat - lat_c) ** 2
+        return (edge_penalty, dist)
+
+    ranked = sorted(unselected, key=placement_score)
+    return ranked[:add_count]
+
+
 def evaluate_config(config, h5_dset, Nt, device, dtype, r_sq=1.0):
-    """Evaluates the D-Optimal objective (log-det) of a configuration."""
+    """Evaluate the D-optimal objective (log-det) of a configuration."""
     K_S = build_k_submatrix(h5_dset, Nt, config, device, dtype, r_sq)
 
-    # print("Factorizing matrix (Cholesky)...")
-    # max_diag = torch.max(torch.abs(K_S.diagonal())).item()
-    # if max_diag == 0:
-    #     max_diag = 1.0
-
-    # # Try pure strict Cholesky first, fallback to tiny jitter if needed
-    # L_S = None
-    # for jitter in [0.0, 1e-8, 1e-6, 1e-4]:
-    #     try:
-    #         if jitter > 0:
-    #             print(f"Strict factorization failed. Retrying with jitter {jitter}...")
-    #             K_temp = K_S.clone()
-    #             K_temp.diagonal().add_(jitter * max_diag)
-    #             L_S = torch.linalg.cholesky(K_temp)
-    #             del K_temp
-    #         else:
-    #             L_S = torch.linalg.cholesky(K_S)
-    #         break
-    #     except torch.linalg.LinAlgError:
-    #         continue
-
-    # if L_S is None:
-    #     print("ERROR: Grid is severely collinear. Matrix is singular.")
-    #     return -np.inf
-
-    # print("Computing log-determinant...")
-    # log_det = 2 * torch.sum(torch.log(torch.diag(L_S))).item()
-
-    # del K_S, L_S
-    # torch.cuda.empty_cache()
-    log_det = torch.linalg.slogdet(K_S)[1].item()
-    
-    return log_det
+    sign, logabsdet = torch.linalg.slogdet(K_S)
+    if sign <= 0:
+        return -np.inf
+    return logabsdet.item()
 
 
 def plot_grid_selection(coords_file, selected_indices, actual_budget):
@@ -184,18 +193,21 @@ def main():
     # 1. CALCULATE BEST 2D BASE GRID
     # -------------------------------------------------------------
     aspect_ratio = args.n_lon / args.n_lat
-    b_lat = 29#max(1, int(round(np.sqrt(args.budget / aspect_ratio))))
-    b_lon = 6#max(1, int(round(args.budget / b_lat)))
+    b_lon = max(1, int(round(np.sqrt(args.budget * aspect_ratio))))
+    b_lat = max(1, min(args.n_lat, args.budget // b_lon))
     base_budget = b_lon * b_lat
 
     print(f"\nTarget Budget: {args.budget}")
     print(f"Optimal 2D Base Grid: {b_lon} (lon) x {b_lat} (lat) = {base_budget} sensors.")
 
-    idx_lon = np.linspace(0, args.n_lon - 1, b_lon, dtype=int)
-    idx_lat = np.linspace(0, args.n_lat - 1, b_lat, dtype=int)
+    idx_lon = uniform_subsample_indices(args.n_lon, b_lon)
+    idx_lat = uniform_subsample_indices(args.n_lat, b_lat)
+    print(f"Longitude column indices ({len(idx_lon)}): {idx_lon.tolist()}")
+    print(f"Latitude row indices ({len(idx_lat)}): {idx_lat.tolist()}")
+
     mesh_lon, mesh_lat = np.meshgrid(idx_lon, idx_lat, indexing='ij')
-    
-    # Latitude changes contiguously (inner loop), Longitude changes on outside (outer loop)
+
+    # Longitude is the outer (slow) index; latitude is contiguous within each column.
     selected_indices = (mesh_lon * args.n_lat + mesh_lat).flatten().tolist()
 
     # -------------------------------------------------------------
@@ -211,9 +223,12 @@ def main():
             selected_indices = rng.choice(selected_indices, args.budget, replace=False).tolist()
         else:
             add_count = args.budget - len(selected_indices)
-            print(f" -> Uniform base is too small. Randomly filling {add_count} empty gaps.")
+            print(f" -> Uniform base is too small. Filling {add_count} gap(s) near grid center.")
             unselected = list(set(range(total_grid_sensors)) - set(selected_indices))
-            extras = rng.choice(unselected, add_count, replace=False).tolist()
+            extras = pick_center_fill_sensors(
+                unselected, add_count, args.n_lon, args.n_lat
+            )
+            print(f" -> Added sensor index(es): {extras}")
             selected_indices.extend(extras)
             
     selected_indices.sort()
@@ -229,8 +244,8 @@ def main():
     print("\n" + "="*40)
     print("         UNIFORM GRID RESULT")
     print("="*40)
-    print(f"Final Network Size : {len(selected_indices)} sensors")
-    print(f"Objective Value    : {score:.6e}")
+    print(f"Final Network Size    : {len(selected_indices)} sensors")
+    print(f"D-Optimal Objective   : {score:.6e}")
     print("="*40 + "\n")
 
     h5_file.close()

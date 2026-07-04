@@ -196,6 +196,35 @@ class RankCheckpointMerger:
             self.offsets[rank] = 0
 
 
+def _count_checkpoint_samples(data):
+    """Return the number of completed samples stored in a checkpoint array."""
+    data = np.atleast_1d(np.asarray(data))
+    if data.ndim == 0:
+        return 1
+    if data.ndim == 1:
+        return len(data)
+    return data.shape[0]
+
+
+def _load_doptimal_checkpoint_values(data):
+    """Extract D-optimal objective values from a checkpoint file.
+
+    Supports:
+    - 1 column: scalar objective per line
+    - 2 columns: reg_obj goal_obj (QOI random-sample checkpoints)
+    - 3+ columns: index reg_obj [goal_obj] (greedy / cross-eval checkpoints)
+    """
+    data = np.asarray(data, dtype=float)
+    if data.ndim == 0:
+        return np.atleast_1d(data)
+    if data.ndim == 1:
+        return data
+    if data.shape[1] == 1:
+        return data[:, 0]
+    if data.shape[1] == 2:
+        return data[:, 0]
+    return data[:, 1]
+
 
 def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
     print("Generating plot...")
@@ -204,10 +233,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
         print(f"Error: {checkpoint_file} not found.")
         return
 
-    rand_data = np.loadtxt(checkpoint_file)
-    if rand_data.ndim > 1:
-        rand_data = rand_data[:, 0]
-
+    rand_data = _load_doptimal_checkpoint_values(np.loadtxt(checkpoint_file))
     valid_reg = rand_data[~np.isinf(rand_data)]
 
     sns.set_palette("colorblind")
@@ -408,7 +434,7 @@ def main():
             try:
                 data = np.loadtxt(args.checkpoint_file)
                 if data.ndim > 0:
-                    existing_samples = len(data) if data.ndim > 1 else len(np.atleast_1d(data))
+                    existing_samples = _count_checkpoint_samples(data)
                 print(f"Found {existing_samples} existing valid samples in {args.checkpoint_file}.")
             except Exception:
                 print("Could not read checkpoint file. Starting fresh.")
