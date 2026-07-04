@@ -306,7 +306,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                 fontweight="bold",
             )
             ax.annotate(
-                "to distribution mean",
+                "to mean",
                 xy=(x_mid_mean, line_y_mean),
                 xytext=(0, -3),  # spacing below line (points); more negative = further down
                 textcoords="offset points",
@@ -341,7 +341,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                     fontweight="bold",
                 )
                 ax.annotate(
-                    "to distribution tail",
+                    "to tail",
                     xy=(x_mid_max, line_y_max),
                     xytext=(0, -3),  # spacing below line (points); more negative = further down
                     textcoords="offset points",
