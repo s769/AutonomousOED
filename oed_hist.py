@@ -295,9 +295,9 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                 zorder=5,
             )
             ax.plot(
-                [optimal_value, optimal_value],
+                [sample_mean, sample_mean],
                 [0, line_y_mean],
-                color="black",
+                color="#C0392B",
                 linestyle="-",
                 linewidth=1.0,
                 zorder=5,
@@ -338,9 +338,9 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                     zorder=5,
                 )
                 ax.plot(
-                    [optimal_value, optimal_value],
+                    [sample_max, sample_max],
                     [0, line_y_max],
-                    color="black",
+                    color="#C0392B",
                     linestyle="-",
                     linewidth=1.0,
                     zorder=5,
