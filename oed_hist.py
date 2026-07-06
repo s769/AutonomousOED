@@ -294,6 +294,14 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                 linewidth=1.5,
                 zorder=5,
             )
+            ax.plot(
+                [optimal_value, optimal_value],
+                [0, line_y_mean],
+                color="black",
+                linestyle="-",
+                linewidth=1.0,
+                zorder=5,
+            )
             x_mid_mean = 0.5 * (sample_mean + optimal_value)
             ax.text(
                 x_mid_mean,
@@ -329,6 +337,14 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                     linewidth=1.5,
                     zorder=5,
                 )
+                ax.plot(
+                    [optimal_value, optimal_value],
+                    [0, line_y_max],
+                    color="black",
+                    linestyle="-",
+                    linewidth=1.0,
+                    zorder=5,
+                )
                 x_mid_max = 0.5 * (sample_max + optimal_value)
                 ax.text(
                     x_mid_max,
@@ -341,7 +357,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                     fontweight="bold",
                 )
                 ax.annotate(
-                    "to tail",
+                    "to max",
                     xy=(x_mid_max, line_y_max),
                     xytext=(0, -3),  # spacing below line (points); more negative = further down
                     textcoords="offset points",
