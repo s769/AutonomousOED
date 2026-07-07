@@ -50,6 +50,18 @@ class TimelineTracer:
             json.dump(payload, f, indent=2)
 
 
+def export_breakdown(path: str, candidate: int, io_ms: dict, gpu_ms: dict, **meta: Any) -> None:
+    payload = {
+        "format": "candidate_breakdown_v1",
+        "candidate": candidate,
+        "io_ms": io_ms,
+        "gpu_ms": gpu_ms,
+        **meta,
+    }
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+
 def _setup_pipeline(h5_path, Nt, k, max_evals, r_sq, precision, device=None):
     if device is None:
         device = resolve_torch_device()
@@ -149,45 +161,121 @@ def _setup_pipeline(h5_path, Nt, k, max_evals, r_sq, precision, device=None):
     }
 
 
-def _dispatch_gpu(ctx, curr_b):
+def _dispatch_gpu(ctx, curr_b, segment_events=None):
     needs_cast = ctx["needs_cast"]
     r_sq = ctx["r_sq"]
+    stream = ctx["streams"][curr_b]
 
-    with torch.cuda.stream(ctx["streams"][curr_b]):
+    def _mark():
+        if segment_events is None:
+            return
+        event = torch.cuda.Event(enable_timing=True)
+        event.record(stream)
+        segment_events.append(event)
+
+    with torch.cuda.stream(stream):
+        _mark()
         ctx["K_Si_gpu_raw"][curr_b].copy_(ctx["pinned_Si"][curr_b], non_blocking=True)
+        _mark()
         ctx["K_ii_gpu_raw"][curr_b].copy_(ctx["pinned_ii"][curr_b], non_blocking=True)
+        _mark()
 
         if needs_cast:
             ctx["K_Si_gpu_math"][curr_b].copy_(
                 ctx["K_Si_gpu_raw"][curr_b], non_blocking=True
             )
+            _mark()
             ctx["K_ii_gpu_math"][curr_b].copy_(
                 ctx["K_ii_gpu_raw"][curr_b], non_blocking=True
             )
+            _mark()
 
         ctx["K_Si_gpu_math"][curr_b].mul_(r_sq)
+        _mark()
         torch.linalg.solve_triangular(
             ctx["L_S"],
             ctx["K_Si_gpu_math"][curr_b],
             upper=False,
             out=ctx["K_Si_gpu_math"][curr_b],
         )
+        _mark()
 
         ctx["K_ii_gpu_math"][curr_b].mul_(r_sq).diagonal().add_(1.0)
+        _mark()
         ctx["K_ii_gpu_math"][curr_b].addmm_(
             ctx["K_Si_gpu_math"][curr_b].T,
             ctx["K_Si_gpu_math"][curr_b],
             alpha=-1.0,
             beta=1.0,
         )
+        _mark()
 
         torch.linalg.cholesky_ex(
             ctx["K_ii_gpu_math"][curr_b],
             check_errors=False,
             out=(ctx["K_ii_gpu_math"][curr_b], ctx["dummy_info"][curr_b]),
         )
+        _mark()
 
-        ctx["gpu_done_events"][curr_b].record(ctx["streams"][curr_b])
+        ctx["gpu_done_events"][curr_b].record(stream)
+
+
+def _gpu_segment_names(needs_cast):
+    names = ["h2d_si", "h2d_ii"]
+    if needs_cast:
+        names += ["cast_si", "cast_ii"]
+    names += ["scale_si", "trsm", "scale_ii_diag", "schur_gemm", "chol"]
+    return names
+
+
+def _record_gpu_segments(tracer, wall_start, markers, names, candidate, buffer):
+    if len(markers) < 2 or len(names) != len(markers) - 1:
+        return
+
+    offset_ms = 0.0
+    for idx, seg_name in enumerate(names):
+        seg_ms = markers[idx].elapsed_time(markers[idx + 1])
+        if seg_ms <= 0:
+            continue
+        tracer.record(
+            "gpu",
+            seg_name,
+            wall_start + offset_ms / 1000.0,
+            wall_start + (offset_ms + seg_ms) / 1000.0,
+            candidate=candidate,
+            buffer=buffer,
+        )
+        offset_ms += seg_ms
+
+
+def _load_candidate_io(ctx, c_idx, buf_idx, record=None):
+    """Load one candidate into pinned buffers; optionally record per-phase times (ms)."""
+    col_start = ctx["candidate_sequence"][c_idx] * ctx["Nt"]
+    col_end = col_start + ctx["Nt"]
+    np_Si_pinned_view = ctx["pinned_Si"][buf_idx].numpy()
+    np_ii_pinned_view = ctx["pinned_ii"][buf_idx].numpy()
+
+    t_si0 = time.perf_counter()
+    load_si_column_blocks(
+        ctx["h5_dset"],
+        col_start,
+        col_end,
+        ctx["Nt"],
+        np_Si_pinned_view,
+        ctx["si_read_plan"],
+        slab_view=ctx["si_slab_np"],
+    )
+    t_si1 = time.perf_counter()
+
+    t_ii0 = time.perf_counter()
+    load_ii_block(ctx["h5_dset"], col_start, col_end, np_ii_pinned_view)
+    t_ii1 = time.perf_counter()
+
+    if record is not None:
+        record["hdf5_read_si"] = (t_si1 - t_si0) * 1000.0
+        record["hdf5_read_ii"] = (t_ii1 - t_ii0) * 1000.0
+
+    return t_ii1 - t_si0
 
 
 def _print_io_summary(total_bytes_read, loader, trace_file, extra_lines=None):
@@ -206,6 +294,133 @@ def _print_io_summary(total_bytes_read, loader, trace_file, extra_lines=None):
             print(line)
     print(f"Trace saved to      : {trace_file}")
     print("=" * 40 + "\n")
+
+
+def _record_gpu_ms(markers, names):
+    gpu_ms = {}
+    if len(markers) < 2 or len(names) != len(markers) - 1:
+        return gpu_ms
+    for idx, seg_name in enumerate(names):
+        seg_ms = markers[idx].elapsed_time(markers[idx + 1])
+        if seg_ms > 0:
+            gpu_ms[seg_name] = seg_ms
+    return gpu_ms
+
+
+def run_breakdown(
+    h5_path,
+    Nt,
+    k,
+    max_evals,
+    r_sq,
+    precision,
+    breakdown_file,
+    breakdown_candidate,
+):
+    if breakdown_candidate < 0 or breakdown_candidate >= max_evals:
+        raise ValueError(
+            f"--breakdown_candidate must be in [0, {max_evals - 1}], "
+            f"got {breakdown_candidate}"
+        )
+
+    ctx = _setup_pipeline(h5_path, Nt, k, max_evals, r_sq, precision)
+    io_ms: dict[str, float] = {}
+    gpu_ms: dict[str, float] = {}
+    segment_names = _gpu_segment_names(ctx["needs_cast"])
+    total_bytes_read = 0
+    target = breakdown_candidate
+
+    class _BreakdownTracer:
+        def record(self, lane, name, start, end, **meta):
+            if meta.get("candidate") != target or lane != "io":
+                return
+            io_ms[name] = io_ms.get(name, 0.0) + (end - start) * 1000.0
+
+    breakdown_tracer = _BreakdownTracer()
+
+    def load_candidate_to_buffer(c_idx, buf_idx):
+        nonlocal total_bytes_read
+        record = io_ms if c_idx == target else None
+        elapsed = _load_candidate_io(ctx, c_idx, buf_idx, record=record)
+        total_bytes_read += ctx["bytes_per_candidate"]
+        return elapsed
+
+    loader = PipelinedLoader(
+        load_candidate_to_buffer,
+        cuda_device=ctx["device"],
+        tracer=breakdown_tracer,
+    )
+
+    if target == 0:
+        t0 = time.perf_counter()
+        ctx["gpu_done_events"][0].synchronize()
+        io_ms["gpu_buffer_wait"] = (time.perf_counter() - t0) * 1000.0
+        loader.load_sync(0, 0)
+    else:
+        loader.load_sync(0, 0)
+    torch.cuda.synchronize()
+
+    print(
+        f"\nMeasuring I/O and GPU breakdown for candidate {target} "
+        f"(after {target} warmup evals)..."
+    )
+
+    for c in tqdm(range(target + 1)):
+        curr_b = c % 2
+        next_b = (c + 1) % 2
+
+        if c > 0:
+            loader.wait()
+
+        if c + 1 < max_evals and c < target:
+            loader.start_async(
+                c + 1,
+                next_b,
+                before_load=ctx["gpu_done_events"][next_b].synchronize,
+            )
+
+        if c == target:
+            markers = []
+            with torch.cuda.stream(ctx["streams"][curr_b]):
+                _dispatch_gpu(ctx, curr_b, markers)
+            torch.cuda.synchronize()
+            gpu_ms.update(_record_gpu_ms(markers, segment_names))
+        else:
+            with torch.cuda.stream(ctx["streams"][curr_b]):
+                _dispatch_gpu(ctx, curr_b)
+
+    loader.wait()
+    torch.cuda.synchronize()
+    ctx["h5_file"].close()
+
+    export_breakdown(
+        breakdown_file,
+        candidate=target,
+        io_ms=io_ms,
+        gpu_ms=gpu_ms,
+        k=k,
+        Nt=Nt,
+    )
+
+    io_total = sum(io_ms.values())
+    gpu_total = sum(gpu_ms.values())
+    print("\n" + "=" * 40)
+    print("     CANDIDATE BREAKDOWN")
+    print("=" * 40)
+    print(f"Candidate           : {target}")
+    print(f"I/O total           : {io_total:.2f} ms")
+    for name in IO_BREAKDOWN_ORDER:
+        if name in io_ms:
+            print(f"  {name:18s}: {io_ms[name]:6.2f} ms ({100 * io_ms[name] / io_total:5.1f}%)")
+    print(f"GPU compute total   : {gpu_total:.2f} ms")
+    for name in segment_names:
+        if name in gpu_ms:
+            print(f"  {name:18s}: {gpu_ms[name]:6.2f} ms ({100 * gpu_ms[name] / gpu_total:5.1f}%)")
+    print(f"Breakdown saved to  : {breakdown_file}")
+    print("=" * 40 + "\n")
+
+
+IO_BREAKDOWN_ORDER = ["gpu_buffer_wait", "hdf5_read_si", "hdf5_read_ii", "hdf5_read"]
 
 
 def run_timeline(
@@ -231,9 +446,8 @@ def run_timeline(
     tracer = TimelineTracer()
     record_state = {"enabled": timeline_record_from == 0, "tracer": tracer}
     total_bytes_read = 0
-    gpu_start_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
-    gpu_end_events = [torch.cuda.Event(enable_timing=True) for _ in range(2)]
     gpu_wall_starts = [0.0, 0.0]
+    io_prefetch_start: dict[int, float] = {}
     loader = None
 
     def _begin_recording(c):
@@ -242,58 +456,43 @@ def run_timeline(
         loader.tracer = record_state["tracer"]
         print(f"Recording timeline from candidate {c} (warmup complete).")
 
-    def _record_gpu(done_candidate, done_b):
-        if not record_state["enabled"] or done_candidate < timeline_record_from:
+    def _sync_and_record_gpu(buf_idx, candidate):
+        ctx["gpu_done_events"][buf_idx].synchronize()
+        if not record_state["enabled"] or candidate < timeline_record_from:
             return
-        gpu_ms = gpu_start_events[done_b].elapsed_time(gpu_end_events[done_b])
+        t_end = record_state["tracer"].now()
         record_state["tracer"].record(
             "gpu",
             "compute",
-            gpu_wall_starts[done_b],
-            gpu_wall_starts[done_b] + gpu_ms / 1000.0,
-            candidate=done_candidate,
-            buffer=done_b,
+            gpu_wall_starts[buf_idx],
+            t_end,
+            candidate=candidate,
+            buffer=buf_idx,
         )
 
     def load_candidate_to_buffer(c_idx, buf_idx):
         nonlocal total_bytes_read
-
-        t0 = time.perf_counter()
-        col_start = ctx["candidate_sequence"][c_idx] * ctx["Nt"]
-        col_end = col_start + ctx["Nt"]
-
-        np_Si_pinned_view = ctx["pinned_Si"][buf_idx].numpy()
-        np_ii_pinned_view = ctx["pinned_ii"][buf_idx].numpy()
-        load_si_column_blocks(
-            ctx["h5_dset"],
-            col_start,
-            col_end,
-            ctx["Nt"],
-            np_Si_pinned_view,
-            ctx["si_read_plan"],
-            slab_view=ctx["si_slab_np"],
-        )
-        load_ii_block(ctx["h5_dset"], col_start, col_end, np_ii_pinned_view)
-
-        t1 = time.perf_counter()
-        if record_state["enabled"] and c_idx >= timeline_record_from:
-            record_state["tracer"].record(
-                "io",
-                "hdf5_read",
-                t0,
-                t1,
-                candidate=c_idx,
-                buffer=buf_idx,
-            )
+        elapsed = _load_candidate_io(ctx, c_idx, buf_idx)
         total_bytes_read += ctx["bytes_per_candidate"]
-        return t1 - t0
+        return elapsed
 
     loader = PipelinedLoader(
         load_candidate_to_buffer,
         cuda_device=ctx["device"],
-        tracer=tracer if record_state["enabled"] else None,
+        tracer=None,
     )
+    if record_state["enabled"]:
+        io_prefetch_start[0] = tracer.now()
     loader.load_sync(0, 0)
+    if record_state["enabled"]:
+        record_state["tracer"].record(
+            "io",
+            "hdf5_read",
+            io_prefetch_start[0],
+            record_state["tracer"].now(),
+            candidate=0,
+            buffer=0,
+        )
     torch.cuda.synchronize()
 
     if timeline_record_from > 0:
@@ -313,32 +512,47 @@ def run_timeline(
 
         if c > 0:
             loader.wait()
-
-        if c + 1 < max_evals:
-            loader.start_async(
-                c + 1,
-                next_b,
-                before_load=ctx["gpu_done_events"][next_b].synchronize,
-            )
-
-        if c >= 2:
-            _record_gpu(c - 2, (c - 2) % 2)
+            if (
+                record_state["enabled"]
+                and c >= timeline_record_from
+                and c in io_prefetch_start
+            ):
+                record_state["tracer"].record(
+                    "io",
+                    "hdf5_read",
+                    io_prefetch_start[c],
+                    record_state["tracer"].now(),
+                    candidate=c,
+                    buffer=curr_b,
+                )
 
         gpu_wall_starts[curr_b] = (
             record_state["tracer"].now() if record_state["enabled"] else time.perf_counter()
         )
         with torch.cuda.stream(ctx["streams"][curr_b]):
-            gpu_start_events[curr_b].record(ctx["streams"][curr_b])
             _dispatch_gpu(ctx, curr_b)
-            gpu_end_events[curr_b].record(ctx["streams"][curr_b])
+
+        if c + 1 < max_evals:
+            gpu_cand = c - 1
+            sync_buf = next_b
+
+            def _before_load(candidate=gpu_cand, buf=sync_buf):
+                if candidate >= 0:
+                    _sync_and_record_gpu(buf, candidate)
+                else:
+                    ctx["gpu_done_events"][buf].synchronize()
+
+            if record_state["enabled"]:
+                io_prefetch_start[c + 1] = record_state["tracer"].now()
+            loader.start_async(c + 1, next_b, before_load=_before_load)
 
     loader.wait()
     torch.cuda.synchronize()
 
-    if max_evals >= 1:
-        _record_gpu(max_evals - 1, (max_evals - 1) % 2)
     if max_evals >= 2:
-        _record_gpu(max_evals - 2, (max_evals - 2) % 2)
+        _sync_and_record_gpu((max_evals - 2) % 2, max_evals - 2)
+    if max_evals >= 1:
+        _sync_and_record_gpu((max_evals - 1) % 2, max_evals - 1)
 
     ctx["h5_file"].close()
     plot_start = start_candidate if start_candidate > 0 else timeline_record_from
@@ -517,6 +731,23 @@ if __name__ == "__main__":
         default=None,
         help="Deprecated alias for --start_candidate",
     )
+    parser.add_argument(
+        "--breakdown",
+        action="store_true",
+        help="Profile I/O and GPU sub-ops for one candidate (separate from timeline)",
+    )
+    parser.add_argument(
+        "--breakdown_candidate",
+        type=int,
+        default=0,
+        help="Candidate index for --breakdown (default: 0)",
+    )
+    parser.add_argument(
+        "--breakdown_file",
+        type=str,
+        default="io_candidate_breakdown.json",
+        help="JSON output for --breakdown",
+    )
 
     args = parser.parse_args()
     start_candidate = args.start_candidate
@@ -526,7 +757,18 @@ if __name__ == "__main__":
         "io_overlap_timeline.json" if args.timeline else "io_compute_overlap.json"
     )
 
-    if args.timeline:
+    if args.breakdown:
+        run_breakdown(
+            args.h5_path,
+            args.Nt,
+            args.k,
+            max(args.max_evals, args.breakdown_candidate + 2),
+            args.r_sq,
+            args.precision,
+            args.breakdown_file,
+            args.breakdown_candidate,
+        )
+    elif args.timeline:
         run_timeline(
             args.h5_path,
             args.Nt,

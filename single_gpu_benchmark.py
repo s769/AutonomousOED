@@ -2,10 +2,7 @@ import torch
 import gc
 import argparse
 import numpy as np
-import matplotlib.pyplot as plt
 import os
-import seaborn as sns
-import matplotlib.transforms as transforms
 
 
 def cleanup():
@@ -372,152 +369,6 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
             )
 
 
-def plot_results(filename, arch):
-    sns.set_context("paper", font_scale=1.3)
-    sns.set_palette("colorblind")
-    sns.set_style("whitegrid")
-    plt.rcParams["font.weight"] = "bold"
-    plt.rcParams["axes.labelweight"] = "bold"
-    plt.rcParams["axes.titleweight"] = "bold"
-
-    data = np.loadtxt(filename, delimiter=",", skiprows=1)
-    data = np.atleast_2d(data)
-    k_vals = data[:, 0]
-
-    # Extract Memory
-    m_no, m_ni, m_so, m_si = data[:, 1], data[:, 2], data[:, 3], data[:, 4]
-    # Extract Time
-    t_no, t_ni, t_so, t_si = data[:, 5], data[:, 6], data[:, 7], data[:, 8]
-
-    # Define styling dictionary to keep plots consistent
-    styles = {
-        "N_OOP": {
-            "marker": "o",
-            "linestyle": "-",
-            "label": "Naive (Out-of-Place)",
-        },
-        "N_IP": {
-            "marker": "v",
-            "linestyle": "--",
-            "label": "Naive (In-Place)",
-        },
-        "S_OOP": {
-            "marker": "^",
-            "linestyle": ":",
-            "label": "Schur Update (Out-of-Place)",
-        },
-        "S_IP": {
-            "marker": "s",
-            "linestyle": "-",
-            "label": "Schur Update (In-Place)",
-        },
-    }
-
-    # ---------------------------
-    # PLOT 1: MEMORY
-    # ---------------------------
-    fig1, ax1 = plt.subplots(figsize=(6, 4.5), dpi=300)
-
-    plot_data_mem = [
-        (m_no, "N_OOP"),
-        (m_ni, "N_IP"),
-        (m_so, "S_OOP"),
-        (m_si, "S_IP"),
-    ]
-
-    for arr, key in plot_data_mem:
-        mask = np.isfinite(arr)
-        ax1.plot(k_vals[mask], arr[mask], linewidth=2.5, markersize=6, **styles[key])
-
-    gpu_details = {
-        "mi250x": {"name": "AMD MI250X", "vram": 64.0, "label": "MI250X VRAM LIMIT"},
-        "a100": {"name": "NVIDIA A100", "vram": 80.0, "label": "A100 VRAM LIMIT"},
-        "gh200": {"name": "NVIDIA GH200", "vram": 96.0, "label": "GH200 VRAM LIMIT"},
-    }
-
-    max_vram = max(details["vram"] for details in gpu_details.values())
-    ax1.set_ylim(0, max_vram * 1.15)
-
-    trans = transforms.blended_transform_factory(ax1.transAxes, ax1.transData)
-
-    for arc in gpu_details:
-        ax1.axhline(
-            y=gpu_details[arc]["vram"],
-            color="#555555",
-            linestyle="--",
-            alpha=0.8,
-        )
-        ax1.text(
-            0.02,
-            gpu_details[arc]["vram"] + 1,
-            gpu_details[arc]["label"],
-            transform=trans,
-            fontweight="bold",
-            fontsize=10,
-            color="black",
-            va="bottom",
-            bbox=dict(facecolor="white", edgecolor="none", alpha=0.85, pad=1.5),
-        )
-
-    ax1.set_xlabel(r"Number of Selected Sensors", fontweight="bold")
-    ax1.set_ylabel(r"Peak GPU VRAM Allocated (GB)", fontweight="bold")
-    ax1.tick_params(axis="both", which="major")
-    ax1.legend(loc="lower right", frameon=True, shadow=True)
-
-    plt.tight_layout()
-    mem_plot_file = filename.replace(".csv", "_memory.pdf")
-    fig1.savefig(mem_plot_file, format="pdf", bbox_inches="tight")
-    print(f"Memory plot saved to {mem_plot_file}")
-
-    # ---------------------------
-    # PLOT 2: TIME WITH INSET
-    # ---------------------------
-    fig2, ax2 = plt.subplots(figsize=(6, 4.5), dpi=300)
-
-    plot_data_time = [(t_no, "N_OOP"), (t_ni, "N_IP"), (t_so, "S_OOP"), (t_si, "S_IP")]
-
-    for arr, key in plot_data_time:
-        mask = np.isfinite(arr)
-        ax2.plot(k_vals[mask], arr[mask], **styles[key])
-
-    ax2.set_xlabel(r"Number of Selected Sensors ($k$)", fontweight="bold")
-    ax2.set_ylabel("Compute Time per Candidate (s)", fontweight="bold")
-    ax2.tick_params(axis="both", which="major")
-    ax2.legend(loc="upper left", frameon=True, shadow=True)
-
-    # --- CREATE THE ZOOMED INSET ---
-    valid_so = np.isfinite(t_so)
-    valid_si = np.isfinite(t_si)
-
-    if np.any(valid_so) and np.any(valid_si):
-        axins = ax2.inset_axes([0.55, 0.25, 0.4, 0.4])
-
-        axins.plot(k_vals[valid_so], t_so[valid_so], **styles["S_OOP"])
-        axins.plot(k_vals[valid_si], t_si[valid_si], **styles["S_IP"])
-
-        max_k_valid = max(k_vals[valid_so].max(), k_vals[valid_si].max())
-        zoom_start_k = max_k_valid * 0.75
-        axins.set_xlim(zoom_start_k, max_k_valid)
-
-        zoom_mask_so = valid_so & (k_vals >= zoom_start_k)
-        zoom_mask_si = valid_si & (k_vals >= zoom_start_k)
-
-        if np.any(zoom_mask_so) and np.any(zoom_mask_si):
-            min_y = min(t_so[zoom_mask_so].min(), t_si[zoom_mask_si].min())
-            max_y = max(t_so[zoom_mask_so].max(), t_si[zoom_mask_si].max())
-            y_margin = (max_y - min_y) * 0.15 if max_y > min_y else max_y * 0.15 + 1e-12
-            axins.set_ylim(min_y - y_margin, max_y + y_margin)
-
-        axins.tick_params(labelsize=9)
-        axins.grid(True, linestyle=":", alpha=0.6)
-        ax2.indicate_inset_zoom(axins, edgecolor="black", alpha=0.3)
-
-    plt.tight_layout()
-    time_plot_file = filename.replace(".csv", "_time_inset.pdf")
-    fig2.savefig(time_plot_file, format="pdf", bbox_inches="tight")
-    print(f"Time plot with inset saved to {time_plot_file}")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--file", type=str, default="ablation_results_420_single.csv")
@@ -525,17 +376,12 @@ if __name__ == "__main__":
     parser.add_argument("--max_budget", type=int, default=600)
     parser.add_argument("--step", type=int, default=10)
     parser.add_argument("--runs", type=int, default=10)
-    parser.add_argument("--plot_only", action="store_true")
-    parser.add_argument("--arch", type=str, default="a100")
     args = parser.parse_args()
 
-    if args.plot_only:
-        plot_results(args.file, args.arch)
-    else:
-        run_benchmark(
-            args.file,
-            Nt=args.Nt,
-            max_budget=args.max_budget,
-            step=args.step,
-            runs=args.runs,
-        )
+    run_benchmark(
+        args.file,
+        Nt=args.Nt,
+        max_budget=args.max_budget,
+        step=args.step,
+        runs=args.runs,
+    )

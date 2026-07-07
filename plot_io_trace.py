@@ -3,6 +3,7 @@ import json
 import os
 
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
 import seaborn as sns
 
 # --- Paper styling ---
@@ -11,32 +12,101 @@ sns.set_style("whitegrid")
 plt.rcParams["font.weight"] = "bold"
 plt.rcParams["axes.labelweight"] = "bold"
 
-LANE_ORDER = ["io", "gpu0", "gpu1"]
+BAR_HEIGHT = 0.5
+MAIN_MIN_MS = 1.0
+CANDIDATE_LABEL_MIN_MS = 40.0
+
+BASE_LANE_ORDER = ["main", "io", "gpu0", "gpu1"]
 LANE_LABELS = {
     "io": "I/O",
-    "gpu0": "GPU stream 0",
-    "gpu1": "GPU stream 1",
+    "main": "Main Thread",
+    "gpu0": "GPU Stream 0",
+    "gpu1": "GPU Stream 1",
 }
+
 IO_COLOR = "#B8B8B8"
+MAIN_COLORS = {
+    "wait_for_io": "#D35400",
+    "await_dispatch": "#E67E22",
+}
 GPU_COLORS = {
     "gpu0": "#2E8B57",
     "gpu1": "#3DA56A",
 }
-IO_EVENT_NAMES = {"gpu_buffer_wait", "hdf5_read"}
-BAR_HEIGHT = 0.5
+
+IO_SIMPLE_NAMES = {"gpu_buffer_wait", "hdf5_read"}
+GPU_AGGREGATE = "compute"
+MAIN_EVENT_NAMES = {"wait_for_io", "await_dispatch"}
+MAIN_LABELS = {
+    "wait_for_io": "Wait for prefetch",
+    "await_dispatch": "Ready → launch",
+}
+
+IO_BREAKDOWN_MERGE = {
+    "gpu_buffer_wait": ["gpu_buffer_wait"],
+    "hdf5_read": ["hdf5_read_si", "hdf5_read_ii", "hdf5_read"],
+}
+IO_BREAKDOWN_ORDER = ["gpu_buffer_wait", "hdf5_read"]
+IO_BREAKDOWN_COLORS = {
+    "gpu_buffer_wait": "#7B4B3A",
+    "hdf5_read": "#4477AA",
+    "other": "#C8C8C8",
+}
+GPU_BREAKDOWN_MERGE = {
+    "cast": [
+        "cast_si",
+        "cast_ii",
+        "scale_si",
+        "scale_ii_diag",
+        "scale_ii",
+        "add_identity",
+    ],
+    "trsm": ["trsm"],
+    "gemm_chol": ["schur_gemm", "chol"],
+}
+GPU_DISPLAY_ORDER = ["cast", "trsm", "gemm_chol"]
+GPU_BREAKDOWN_COLORS = {
+    "cast": "#AA3377",
+    "trsm": "#004488",
+    "gemm_chol": "#C75146",
+    "other": "#8E44AD",
+}
+ALWAYS_SHOW_BREAKDOWN = frozenset(IO_BREAKDOWN_ORDER + GPU_DISPLAY_ORDER)
+BREAKDOWN_LABELS = {
+    "gpu_buffer_wait": "GPU Buffer Wait",
+    "hdf5_read": "HDF5 Read",
+    "cast": "Cast + Preprocess",
+    "trsm": "TRSM",
+    "gemm_chol": "GEMM + Cholesky",
+    "other_io": "Misc. I/O",
+    "other_gpu": "Misc. GPU",
+    **MAIN_LABELS,
+}
+IN_BAR_LABEL_MIN_PCT = 10.0
+MIN_BAR_VIS_PCT = 1.2
+MAIN_GRID = {"axis": "x", "alpha": 0.3, "color": "gray", "linestyle": "--"}
 
 
 def _detect_format(trace_data):
-    if trace_data.get("format") == "pipelined_timeline_v1":
+    fmt = trace_data.get("format")
+    if fmt in ("pipelined_timeline_v1", "pipelined_timeline_v2"):
         return "manual"
     if "traceEvents" in trace_data:
         return "pytorch"
     raise ValueError("Unrecognized trace format.")
 
 
+def _load_breakdown(path):
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("format") != "candidate_breakdown_v1":
+        raise ValueError(f"Expected candidate_breakdown_v1, got {data.get('format')!r}")
+    return data
+
+
 def _events_for_plot(events, start_candidate, num_candidates=None):
-    """GPU: candidates [x-1, x+3]; I/O: candidates [x, x+4]."""
-    del num_candidates  # window is fixed relative to start_candidate
+    """GPU: candidates [x-1, x+3]; I/O and main: candidates [x, x+4]."""
+    del num_candidates
     gpu_min = start_candidate - 1 if start_candidate > 0 else start_candidate
     gpu_max = start_candidate + 3
     io_min = start_candidate
@@ -47,9 +117,22 @@ def _events_for_plot(events, start_candidate, num_candidates=None):
         c = e.get("candidate")
         if c is None:
             continue
-        if e["lane"] == "io" and io_min <= c <= io_max and e["name"] in IO_EVENT_NAMES:
-            selected.append(e)
-        elif e["lane"] == "gpu" and e["name"] == "compute" and gpu_min <= c <= gpu_max:
+
+        if e["lane"] == "io" and io_min <= c <= io_max:
+            if e["name"] in IO_SIMPLE_NAMES:
+                selected.append(e)
+        elif (
+            e["lane"] == "main"
+            and io_min <= c <= io_max
+            and e["name"] in MAIN_EVENT_NAMES
+            and e["dur_ms"] >= MAIN_MIN_MS
+        ):
+            selected.append({**e, "lane": "main"})
+        elif (
+            e["lane"] == "gpu"
+            and gpu_min <= c <= gpu_max
+            and e["name"] == GPU_AGGREGATE
+        ):
             selected.append(e)
     return selected
 
@@ -79,6 +162,55 @@ def _merge_io_events(events):
     ]
 
 
+def _main_covers_interval(main_events, candidate, start_ms, end_ms):
+    for event in main_events:
+        if event.get("candidate") != candidate:
+            continue
+        ev_start = event["start_ms"]
+        ev_end = event["start_ms"] + event["dur_ms"]
+        if ev_start <= start_ms + 0.05 and ev_end >= end_ms - 0.05:
+            return True
+    return False
+
+
+def _fill_dispatch_gaps(io_bars, all_events, main_events, start_candidate):
+    gpu_min = start_candidate - 1 if start_candidate > 0 else start_candidate
+    gpu_max = start_candidate + 3
+    gpu_by_candidate = {
+        e["candidate"]: e
+        for e in all_events
+        if e["lane"] == "gpu"
+        and e["name"] == GPU_AGGREGATE
+        and gpu_min <= e["candidate"] <= gpu_max
+    }
+    filled = list(main_events)
+
+    for io_event in io_bars:
+        candidate = io_event["candidate"]
+        gpu_event = gpu_by_candidate.get(candidate)
+        if gpu_event is None:
+            continue
+
+        io_end = io_event["start_ms"] + io_event["dur_ms"]
+        gpu_start = gpu_event["start_ms"]
+        gap_ms = gpu_start - io_end
+        if gap_ms < MAIN_MIN_MS:
+            continue
+        if _main_covers_interval(filled, candidate, io_end, gpu_start):
+            continue
+
+        filled.append(
+            {
+                "lane": "main",
+                "name": "await_dispatch",
+                "start_ms": io_end,
+                "dur_ms": gap_ms,
+                "candidate": candidate,
+            }
+        )
+    return filled
+
+
 def _window_from_events(events, pad_frac=0.03):
     if not events:
         return 0.0, 1.0
@@ -106,10 +238,223 @@ def _lane_y_positions(lane_order):
     }
 
 
-def _lane_color(lane):
+def _event_color(event):
+    lane = event["lane"]
+    name = event.get("name")
+    if lane == "main":
+        return MAIN_COLORS.get(name, "#E67E22")
     if lane == "io":
         return IO_COLOR
-    return GPU_COLORS.get(lane, GPU_COLORS["gpu0"])
+    if lane.startswith("gpu"):
+        return GPU_COLORS.get(lane, GPU_COLORS["gpu0"])
+    return IO_COLOR
+
+
+def _build_plot_events(filtered, all_events, start_candidate):
+    del all_events, start_candidate
+    io_raw = [e for e in filtered if e["lane"] == "io"]
+    io_plot = _merge_io_events(io_raw)
+    gpu_plot = [
+        {**e, "lane": _gpu_plot_lane(e)}
+        for e in filtered
+        if e["lane"] == "gpu" and e["name"] == GPU_AGGREGATE
+    ]
+    return io_plot + gpu_plot
+
+
+def _legend_handles(visible):
+    del visible
+    return []
+
+
+def _consolidate_ms(ms_dict, merge_map):
+    consolidated = {}
+    used = set()
+    for key, sources in merge_map.items():
+        total = sum(ms_dict.get(source, 0.0) for source in sources)
+        if total > 0:
+            consolidated[key] = total
+        used.update(sources)
+    for name, value in ms_dict.items():
+        if name not in used:
+            consolidated[name] = consolidated.get(name, 0.0) + value
+    return consolidated
+
+
+def _rect_handle(color, label):
+    return plt.Rectangle(
+        (0, 0),
+        1,
+        1,
+        facecolor=color,
+        edgecolor="black",
+        linewidth=0.6,
+        label=label,
+    )
+
+
+def _breakdown_slices(ms_dict, order, colors, min_runtime_pct, other_label):
+    total = sum(ms_dict.values())
+    if total <= 0:
+        return [], [], []
+
+    ordered_names = [name for name in order if name in ms_dict]
+    for name in sorted(ms_dict):
+        if name not in ordered_names and name != "_other_raw":
+            ordered_names.append(name)
+
+    labels, values, facecolors = [], [], []
+    other = 100.0 * ms_dict.get("_other_raw", 0.0) / total
+    for name in ordered_names:
+        pct = 100.0 * ms_dict[name] / total
+        if (
+            min_runtime_pct > 0
+            and pct < min_runtime_pct
+            and name not in ALWAYS_SHOW_BREAKDOWN
+        ):
+            other += pct
+            continue
+        labels.append(BREAKDOWN_LABELS.get(name, name.replace("_", " ")))
+        values.append(pct)
+        facecolors.append(colors.get(name, "#CCCCCC"))
+
+    if other > 0:
+        labels.append(other_label)
+        values.append(other)
+        facecolors.append(colors["other"])
+    return labels, values, facecolors
+
+
+def _display_bar_widths(values):
+    """Minimum visual width so tiny segments (e.g. GEMM) remain visible."""
+    boosted = [max(v, MIN_BAR_VIS_PCT) if v > 0 else 0.0 for v in values]
+    total = sum(boosted)
+    if total <= 0:
+        return list(values)
+    return [100.0 * v / total for v in boosted]
+
+
+def _breakdown_rows(breakdown, min_runtime_pct):
+    io_ms = _consolidate_ms(breakdown.get("io_ms", {}), IO_BREAKDOWN_MERGE)
+    gpu_ms = _consolidate_ms(breakdown.get("gpu_ms", {}), GPU_BREAKDOWN_MERGE)
+    other_gpu = sum(
+        gpu_ms.pop(key) for key in list(gpu_ms) if key not in GPU_DISPLAY_ORDER
+    )
+    if other_gpu > 0:
+        gpu_ms["cast"] = gpu_ms.get("cast", 0.0) + other_gpu
+
+    rows = []
+    labels, values, facecolors = _breakdown_slices(
+        io_ms,
+        IO_BREAKDOWN_ORDER,
+        IO_BREAKDOWN_COLORS,
+        min_runtime_pct,
+        BREAKDOWN_LABELS["other_io"],
+    )
+    if values:
+        rows.append(("I/O", labels, values, facecolors))
+
+    labels, values, facecolors = _breakdown_slices(
+        gpu_ms,
+        GPU_DISPLAY_ORDER,
+        GPU_BREAKDOWN_COLORS,
+        min_runtime_pct,
+        BREAKDOWN_LABELS["other_gpu"],
+    )
+    if values:
+        rows.append(("GPU", labels, values, facecolors))
+    return rows
+
+
+def _breakdown_legend_handles(rows):
+    handles = []
+    seen = set()
+    skip = {BREAKDOWN_LABELS["other_io"], BREAKDOWN_LABELS["other_gpu"]}
+    for _, labels, _, facecolors in rows:
+        for label, color in zip(labels, facecolors):
+            if label in seen or label in skip:
+                continue
+            seen.add(label)
+            handles.append(_rect_handle(color, label))
+    return handles
+
+
+def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
+    rows = _breakdown_rows(breakdown, min_runtime_pct)
+    if not rows:
+        ax.set_visible(False)
+        return []
+
+    y_positions = list(range(len(rows) - 1, -1, -1))
+    bar_h = 0.62
+    for y, (row_name, labels, values, facecolors) in zip(y_positions, rows):
+        display_widths = _display_bar_widths(values)
+        left = 0.0
+        for value, width, color in zip(values, display_widths, facecolors):
+            ax.barh(
+                y,
+                width,
+                left=left,
+                height=bar_h,
+                color=color,
+                edgecolor="black",
+                linewidth=0.5,
+            )
+            if value >= IN_BAR_LABEL_MIN_PCT:
+                ax.text(
+                    left + width / 2,
+                    y,
+                    f"{value:.0f}%",
+                    ha="center",
+                    va="center",
+                    fontsize=6,
+                    fontweight="bold",
+                    color="white" if value > 20 else "black",
+                )
+            left += width
+        ax.text(
+            -4,
+            y,
+            row_name,
+            ha="right",
+            va="center",
+            fontsize=7,
+            fontweight="bold",
+        )
+
+    ax.set_xlim(-10, 100)
+    ax.set_ylim(-0.55, len(rows) - 0.35 + bar_h / 2)
+    ax.set_xticks([0, 25, 50, 75, 100])
+    ax.set_xticks(range(0, 101, 5), minor=True)
+    ax.set_xticklabels(["0", "25", "50", "75", "100"], fontsize=6.5)
+    ax.set_xlabel("Runtime Breakdown (%)", fontsize=7, fontweight="bold", labelpad=6)
+    ax.set_yticks([])
+    for spine in ("top", "right", "left"):
+        ax.spines[spine].set_visible(False)
+    ax.grid(True, which="major", **MAIN_GRID)
+    ax.grid(True, which="minor", axis="x", alpha=0.15, color="gray", linestyle=":")
+
+    return _breakdown_legend_handles(rows)
+
+
+def _place_bottom_legend(ax_legend, handles, ncol=None):
+    if not handles:
+        ax_legend.set_visible(False)
+        return
+
+    if ncol is None:
+        ncol = len(handles)
+    ax_legend.legend(
+        handles=handles,
+        loc="center",
+        bbox_to_anchor=(0.5, 0.5),
+        bbox_transform=ax_legend.transAxes,
+        ncol=ncol,
+        fontsize=9,
+        frameon=True,
+        handlelength=1.6,
+        columnspacing=1.2,
+    )
 
 
 def plot_manual_timeline(
@@ -117,6 +462,9 @@ def plot_manual_timeline(
     output_file,
     start_candidate=None,
     num_candidates=None,
+    breakdown=None,
+    min_runtime_pct=0,
+    legend_y=None,
 ):
     events = trace_data.get("events", [])
     if start_candidate is None:
@@ -138,9 +486,8 @@ def plot_manual_timeline(
             f"I/O {start_candidate}–{start_candidate + 4})."
         )
 
-    plot_events = _merge_io_events(filtered) + [
-        {**e, "lane": _gpu_plot_lane(e)} for e in filtered if e["lane"] == "gpu"
-    ]
+    plot_events = _build_plot_events(filtered, events, start_candidate)
+    lane_order = [lane for lane in BASE_LANE_ORDER if lane != "main"]
 
     plot_start, plot_end = _window_from_events(plot_events)
     visible = [
@@ -149,16 +496,50 @@ def plot_manual_timeline(
         if e["start_ms"] + e["dur_ms"] >= plot_start and e["start_ms"] <= plot_end
     ]
 
-    fig, ax = plt.subplots(figsize=(10, 2.2), dpi=300)
+    fig_height = 2.2
+    has_breakdown = breakdown is not None and (
+        breakdown.get("io_ms") or breakdown.get("gpu_ms")
+    )
+    label_row = 0.10   # spacer for x-axis label below the plot
+    legend_row = 0.16 if legend_y is None else max(0.10, legend_y)
 
-    y_positions = _lane_y_positions(LANE_ORDER)
+    if has_breakdown:
+        fig = plt.figure(figsize=(10, fig_height + 0.58), dpi=300)
+        gs = gridspec.GridSpec(
+            3,
+            2,
+            figure=fig,
+            height_ratios=[1.0, label_row, legend_row],
+            width_ratios=[2.25, 0.68],
+            wspace=0.10,
+            hspace=0.22,
+        )
+        ax = fig.add_subplot(gs[0, 0])
+        ax_breakdown = fig.add_subplot(gs[0, 1])
+        ax_legend = fig.add_subplot(gs[2, :])
+    else:
+        fig = plt.figure(figsize=(10, fig_height + 0.42), dpi=300)
+        gs = gridspec.GridSpec(
+            3,
+            1,
+            figure=fig,
+            height_ratios=[1.0, label_row, legend_row],
+            hspace=0.22,
+        )
+        ax = fig.add_subplot(gs[0, 0])
+        ax_breakdown = None
+        ax_legend = fig.add_subplot(gs[2, 0])
+
+    ax_legend.axis("off")
+
+    y_positions = _lane_y_positions(lane_order)
 
     for event in visible:
         lane = event["lane"]
         y = y_positions[lane]
         left = event["start_ms"] - plot_start
         width = event["dur_ms"]
-        color = _lane_color(lane)
+        color = _event_color(event)
 
         ax.barh(
             y,
@@ -172,7 +553,11 @@ def plot_manual_timeline(
         )
 
         candidate = event.get("candidate")
-        if candidate is not None and width > 12:
+        if (
+            candidate is not None
+            and lane != "main"
+            and width >= CANDIDATE_LABEL_MIN_MS
+        ):
             label = _candidate_label(candidate)
             text_color = "black" if lane == "io" else "white"
             ax.text(
@@ -188,18 +573,38 @@ def plot_manual_timeline(
                 clip_on=False,
             )
 
-    ax.set_yticks([y_positions[lane] for lane in LANE_ORDER])
-    ax.set_yticklabels([LANE_LABELS[lane] for lane in LANE_ORDER], fontweight="bold")
-    ax.set_xlabel("Time (ms)", fontweight="bold")
-    ax.tick_params(colors="black")
+    ax.set_yticks([y_positions[lane] for lane in lane_order])
+    ax.set_yticklabels([LANE_LABELS[lane] for lane in lane_order], fontweight="bold")
+    ax.set_xlabel("Time (ms)", fontweight="bold", labelpad=6)
+    ax.tick_params(colors="black", pad=2)
     for spine in ["top", "right"]:
         ax.spines[spine].set_visible(False)
 
-    ax.grid(True, axis="x", alpha=0.3, color="gray", linestyle="--")
-    ax.set_ylim(0, BAR_HEIGHT * len(LANE_ORDER))
+    ax.grid(True, **MAIN_GRID)
+    ax.set_ylim(0, BAR_HEIGHT * len(lane_order))
 
-    plt.tight_layout()
-    plt.savefig(output_file, facecolor="white")
+    legend_handles = _legend_handles(visible)
+    if has_breakdown:
+        breakdown_handles = _draw_breakdown_panel(
+            ax_breakdown, breakdown, min_runtime_pct
+        )
+        legend_handles.extend(breakdown_handles)
+
+    ncol = max(len(legend_handles), 1)
+    _place_bottom_legend(ax_legend, legend_handles, ncol=ncol)
+
+    fig.subplots_adjust(
+        left=0.15 if has_breakdown else 0.13,
+        right=0.98,
+        top=0.88,
+        bottom=0.01,
+    )
+
+    fig.savefig(output_file, facecolor="white", pad_inches=0.05)
+    root, ext = os.path.splitext(output_file)
+    if ext.lower() == ".pdf":
+        fig.savefig(f"{root}.png", facecolor="white", dpi=200, pad_inches=0.05)
+    plt.close(fig)
     print(f"Timeline plot saved to '{output_file}'")
 
 
@@ -265,7 +670,7 @@ def plot_pytorch_trace(trace_data, output_file):
             dur,
             left=start,
             height=BAR_HEIGHT,
-            color=GPU_COLOR,
+            color=GPU_COLORS["gpu0"],
             edgecolor="black",
             linewidth=0.6,
         )
@@ -291,6 +696,9 @@ def plot_trace(
     start_candidate=None,
     num_candidates=None,
     focus_candidate=None,
+    breakdown_file=None,
+    min_runtime_pct=0,
+    legend_y=None,
 ):
     if focus_candidate is not None and start_candidate is None:
         start_candidate = focus_candidate
@@ -303,6 +711,14 @@ def plot_trace(
     with open(trace_file, "r", encoding="utf-8") as f:
         trace_data = json.load(f)
 
+    breakdown = None
+    if breakdown_file:
+        if not os.path.exists(breakdown_file):
+            print(f"Warning: breakdown file '{breakdown_file}' not found; skipping inset.")
+        else:
+            print(f"Loading breakdown inset from {breakdown_file}...")
+            breakdown = _load_breakdown(breakdown_file)
+
     trace_format = _detect_format(trace_data)
     if trace_format == "manual":
         plot_manual_timeline(
@@ -310,6 +726,9 @@ def plot_trace(
             output_file,
             start_candidate=start_candidate,
             num_candidates=num_candidates,
+            breakdown=breakdown,
+            min_runtime_pct=min_runtime_pct,
+            legend_y=legend_y,
         )
     else:
         plot_pytorch_trace(trace_data, output_file)
@@ -347,6 +766,31 @@ if __name__ == "__main__":
         default=None,
         help="Deprecated alias for --start_candidate",
     )
+    parser.add_argument(
+        "--breakdown_file",
+        type=str,
+        default=None,
+        help="JSON from io_profile.py --breakdown; shown as % inset on the timeline",
+    )
+    parser.add_argument(
+        "--min_runtime_pct",
+        type=float,
+        default=0,
+        help=(
+            "Breakdown panel only: hide sub-ops below this %% of their lane total "
+            "(0 shows all; 1 keeps ops >= 1%%)."
+        ),
+    )
+    parser.add_argument(
+        "--legend_y",
+        type=float,
+        default=None,
+        help=(
+            "Height of the legend row relative to the plot row "
+            "(default: 0.16). Decrease (e.g. 0.12) to tighten the gap; "
+            "increase if the legend is clipped."
+        ),
+    )
     args = parser.parse_args()
 
     plot_trace(
@@ -355,4 +799,7 @@ if __name__ == "__main__":
         start_candidate=args.start_candidate,
         num_candidates=args.num_candidates,
         focus_candidate=args.focus_candidate,
+        breakdown_file=args.breakdown_file,
+        min_runtime_pct=args.min_runtime_pct,
+        legend_y=args.legend_y,
     )
