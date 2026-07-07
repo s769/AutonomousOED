@@ -60,21 +60,39 @@ def load_data(filename, ranks_per_node, max_nodes=256, x_units="nodes"):
     return {"x_vals": x_vals, "wall_time": data[:, 4]}
 
 
-def add_efficiency_annotations(ax, x_vals, obs_time, ideal_time, offset=(0, 8)):
+def add_efficiency_annotations(
+    ax, x_vals, obs_time, ideal_time, offset=(0, 8), y_offset_data=None
+):
     """Calculates efficiency and adds text annotations."""
     for i in range(len(x_vals)):
         eff = (ideal_time[i] / obs_time[i]) * 100.0
-        ax.annotate(
-            f"{eff:.0f}%",
-            (x_vals[i], obs_time[i]),
-            textcoords="offset points",
-            xytext=offset,
-            ha="center",
-            fontsize=9,
-            fontweight="bold",
-            color="#333333",
-            bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.0),
-        )
+        if y_offset_data is not None:
+            y_text = obs_time[i] + y_offset_data
+            va = "bottom" if y_offset_data > 0 else "top"
+            ax.annotate(
+                f"{eff:.0f}%",
+                (x_vals[i], obs_time[i]),
+                xytext=(x_vals[i], y_text),
+                textcoords="data",
+                ha="center",
+                va=va,
+                fontsize=9,
+                fontweight="bold",
+                color="#333333",
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.0),
+            )
+        else:
+            ax.annotate(
+                f"{eff:.0f}%",
+                (x_vals[i], obs_time[i]),
+                textcoords="offset points",
+                xytext=offset,
+                ha="center",
+                fontsize=9,
+                fontweight="bold",
+                color="#333333",
+                bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1.0),
+            )
 
 
 def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=False):
@@ -111,9 +129,8 @@ def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=Fals
             alpha=0.8,
             zorder=4,
         )
-        if annotate:
-            off = (0, 10) if not is_weak else (0, -15)
-            add_efficiency_annotations(ax, x_pm, wt_pm, ideal_pm, offset=off)
+        if annotate and not is_weak:
+            add_efficiency_annotations(ax, x_pm, wt_pm, ideal_pm, offset=(0, 10))
 
     # Frontier
     if fr_data is not None:
@@ -140,10 +157,8 @@ def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=Fals
             alpha=0.8,
             zorder=4,
         )
-        if annotate:
-            # Shift Frontier annotations down for strong scaling to avoid overlap
-            off = (0, -15) if not is_weak else (0, 12)
-            add_efficiency_annotations(ax, x_fr, wt_fr, ideal_fr, offset=off)
+        if annotate and not is_weak:
+            add_efficiency_annotations(ax, x_fr, wt_fr, ideal_fr, offset=(0, -15))
 
     ax.set_xlabel(x_label, fontweight="bold")
     ax.set_ylabel("Wall Time (s)", fontweight="bold")
@@ -162,6 +177,20 @@ def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=Fals
             [d["wall_time"].max() for d in [pm_data, fr_data] if d is not None]
         )
         ax.set_ylim(top=top_val * 1.25)
+        if annotate:
+            y_pad = top_val * 0.07
+            if pm_data is not None:
+                x_pm, wt_pm = pm_data["x_vals"], pm_data["wall_time"]
+                ideal_pm = np.full_like(x_pm, wt_pm[0])
+                add_efficiency_annotations(
+                    ax, x_pm, wt_pm, ideal_pm, y_offset_data=y_pad
+                )
+            if fr_data is not None:
+                x_fr, wt_fr = fr_data["x_vals"], fr_data["wall_time"]
+                ideal_fr = np.full_like(x_fr, wt_fr[0])
+                add_efficiency_annotations(
+                    ax, x_fr, wt_fr, ideal_fr, y_offset_data=-y_pad
+                )
 
     if all_x:
         ax.set_xticks(sorted(list(all_x)))

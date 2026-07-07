@@ -42,18 +42,10 @@ MAIN_LABELS = {
     "await_dispatch": "Ready → launch",
 }
 
-IO_BREAKDOWN_MERGE = {
-    "gpu_buffer_wait": ["gpu_buffer_wait"],
-    "hdf5_read": ["hdf5_read_si", "hdf5_read_ii", "hdf5_read"],
-}
-IO_BREAKDOWN_ORDER = ["gpu_buffer_wait", "hdf5_read"]
-IO_BREAKDOWN_COLORS = {
-    "gpu_buffer_wait": "#7B4B3A",
-    "hdf5_read": "#4477AA",
-    "other": "#C8C8C8",
-}
 GPU_BREAKDOWN_MERGE = {
     "cast": [
+        "h2d_si",
+        "h2d_ii",
         "cast_si",
         "cast_ii",
         "scale_si",
@@ -71,20 +63,25 @@ GPU_BREAKDOWN_COLORS = {
     "gemm_chol": "#C75146",
     "other": "#8E44AD",
 }
-ALWAYS_SHOW_BREAKDOWN = frozenset(IO_BREAKDOWN_ORDER + GPU_DISPLAY_ORDER)
+ALWAYS_SHOW_BREAKDOWN = frozenset(GPU_DISPLAY_ORDER)
 BREAKDOWN_LABELS = {
-    "gpu_buffer_wait": "GPU Buffer Wait",
     "hdf5_read": "HDF5 Read",
     "cast": "Cast + Preprocess",
     "trsm": "TRSM",
     "gemm_chol": "GEMM + Cholesky",
-    "other_io": "Misc. I/O",
     "other_gpu": "Misc. GPU",
     **MAIN_LABELS,
 }
 IN_BAR_LABEL_MIN_PCT = 10.0
 MIN_BAR_VIS_PCT = 1.2
 MAIN_GRID = {"axis": "x", "alpha": 0.3, "color": "gray", "linestyle": "--"}
+BREAKDOWN_MAJOR_GRID = {
+    "axis": "x",
+    "alpha": 0.3,
+    "color": "gray",
+    "linestyle": "-",
+    "linewidth": 1.2,
+}
 
 
 def _detect_format(trace_data):
@@ -335,24 +332,12 @@ def _display_bar_widths(values):
 
 
 def _breakdown_rows(breakdown, min_runtime_pct):
-    io_ms = _consolidate_ms(breakdown.get("io_ms", {}), IO_BREAKDOWN_MERGE)
     gpu_ms = _consolidate_ms(breakdown.get("gpu_ms", {}), GPU_BREAKDOWN_MERGE)
     other_gpu = sum(
         gpu_ms.pop(key) for key in list(gpu_ms) if key not in GPU_DISPLAY_ORDER
     )
     if other_gpu > 0:
         gpu_ms["cast"] = gpu_ms.get("cast", 0.0) + other_gpu
-
-    rows = []
-    labels, values, facecolors = _breakdown_slices(
-        io_ms,
-        IO_BREAKDOWN_ORDER,
-        IO_BREAKDOWN_COLORS,
-        min_runtime_pct,
-        BREAKDOWN_LABELS["other_io"],
-    )
-    if values:
-        rows.append(("I/O", labels, values, facecolors))
 
     labels, values, facecolors = _breakdown_slices(
         gpu_ms,
@@ -361,15 +346,15 @@ def _breakdown_rows(breakdown, min_runtime_pct):
         min_runtime_pct,
         BREAKDOWN_LABELS["other_gpu"],
     )
-    if values:
-        rows.append(("GPU", labels, values, facecolors))
-    return rows
+    if not values:
+        return []
+    return [("GPU", labels, values, facecolors)]
 
 
 def _breakdown_legend_handles(rows):
     handles = []
     seen = set()
-    skip = {BREAKDOWN_LABELS["other_io"], BREAKDOWN_LABELS["other_gpu"]}
+    skip = {BREAKDOWN_LABELS["other_gpu"]}
     for _, labels, _, facecolors in rows:
         for label, color in zip(labels, facecolors):
             if label in seen or label in skip:
@@ -383,16 +368,17 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
     rows = _breakdown_rows(breakdown, min_runtime_pct)
     if not rows:
         ax.set_visible(False)
-        return []
+        return
 
-    y_positions = list(range(len(rows) - 1, -1, -1))
-    bar_h = 0.62
-    for y, (row_name, labels, values, facecolors) in zip(y_positions, rows):
+    candidate = breakdown.get("candidate", "?")
+    y_center = 0.25
+    bar_h = 0.42
+    for _, labels, values, facecolors in rows:
         display_widths = _display_bar_widths(values)
         left = 0.0
         for value, width, color in zip(values, display_widths, facecolors):
             ax.barh(
-                y,
+                y_center,
                 width,
                 left=left,
                 height=bar_h,
@@ -403,7 +389,7 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
             if value >= IN_BAR_LABEL_MIN_PCT:
                 ax.text(
                     left + width / 2,
-                    y,
+                    y_center,
                     f"{value:.0f}%",
                     ha="center",
                     va="center",
@@ -412,29 +398,37 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
                     color="white" if value > 20 else "black",
                 )
             left += width
-        ax.text(
-            -4,
-            y,
-            row_name,
-            ha="right",
-            va="center",
-            fontsize=7,
-            fontweight="bold",
-        )
 
-    ax.set_xlim(-10, 100)
-    ax.set_ylim(-0.55, len(rows) - 0.35 + bar_h / 2)
+    ax.set_xlim(0, 100)
+    ax.set_ylim(0, 0.72)
     ax.set_xticks([0, 25, 50, 75, 100])
     ax.set_xticks(range(0, 101, 5), minor=True)
     ax.set_xticklabels(["0", "25", "50", "75", "100"], fontsize=6.5)
-    ax.set_xlabel("Runtime Breakdown (%)", fontsize=7, fontweight="bold", labelpad=6)
+    ax.set_xlabel(
+        f"GPU Runtime Breakdown (%)\n— {_candidate_label(candidate)}",
+        fontsize=7,
+        fontweight="bold",
+        labelpad=10,
+    )
     ax.set_yticks([])
     for spine in ("top", "right", "left"):
         ax.spines[spine].set_visible(False)
-    ax.grid(True, which="major", **MAIN_GRID)
+    ax.grid(True, which="major", **BREAKDOWN_MAJOR_GRID)
     ax.grid(True, which="minor", axis="x", alpha=0.15, color="gray", linestyle=":")
 
-    return _breakdown_legend_handles(rows)
+    handles = _breakdown_legend_handles(rows)
+    if handles:
+        ax.legend(
+            [h for h in handles],
+            [h.get_label() for h in handles],
+            loc="upper right",
+            ncol=1,
+            fontsize=6,
+            frameon=True,
+            handlelength=1.2,
+            labelspacing=0.35,
+            borderaxespad=0.4,
+        )
 
 
 def _place_bottom_legend(ax_legend, handles, ncol=None):
@@ -497,26 +491,24 @@ def plot_manual_timeline(
     ]
 
     fig_height = 2.2
-    has_breakdown = breakdown is not None and (
-        breakdown.get("io_ms") or breakdown.get("gpu_ms")
-    )
-    label_row = 0.10   # spacer for x-axis label below the plot
+    has_breakdown = breakdown is not None and breakdown.get("gpu_ms")
+    label_row = 0.16   # spacer for x-axis labels below the plot
     legend_row = 0.16 if legend_y is None else max(0.10, legend_y)
 
     if has_breakdown:
-        fig = plt.figure(figsize=(10, fig_height + 0.58), dpi=300)
+        fig = plt.figure(figsize=(10, fig_height + 0.42), dpi=300)
         gs = gridspec.GridSpec(
-            3,
+            2,
             2,
             figure=fig,
-            height_ratios=[1.0, label_row, legend_row],
-            width_ratios=[2.25, 0.68],
-            wspace=0.10,
+            height_ratios=[1.0, label_row],
+            width_ratios=[2.25, 0.78],
+            wspace=0.12,
             hspace=0.22,
         )
         ax = fig.add_subplot(gs[0, 0])
         ax_breakdown = fig.add_subplot(gs[0, 1])
-        ax_legend = fig.add_subplot(gs[2, :])
+        ax_legend = None
     else:
         fig = plt.figure(figsize=(10, fig_height + 0.42), dpi=300)
         gs = gridspec.GridSpec(
@@ -530,7 +522,8 @@ def plot_manual_timeline(
         ax_breakdown = None
         ax_legend = fig.add_subplot(gs[2, 0])
 
-    ax_legend.axis("off")
+    if ax_legend is not None:
+        ax_legend.axis("off")
 
     y_positions = _lane_y_positions(lane_order)
 
@@ -575,7 +568,7 @@ def plot_manual_timeline(
 
     ax.set_yticks([y_positions[lane] for lane in lane_order])
     ax.set_yticklabels([LANE_LABELS[lane] for lane in lane_order], fontweight="bold")
-    ax.set_xlabel("Time (ms)", fontweight="bold", labelpad=6)
+    ax.set_xlabel("Time (ms)", fontweight="bold", labelpad=10)
     ax.tick_params(colors="black", pad=2)
     for spine in ["top", "right"]:
         ax.spines[spine].set_visible(False)
@@ -585,25 +578,21 @@ def plot_manual_timeline(
 
     legend_handles = _legend_handles(visible)
     if has_breakdown:
-        breakdown_handles = _draw_breakdown_panel(
-            ax_breakdown, breakdown, min_runtime_pct
-        )
-        legend_handles.extend(breakdown_handles)
-
-    ncol = max(len(legend_handles), 1)
-    _place_bottom_legend(ax_legend, legend_handles, ncol=ncol)
+        _draw_breakdown_panel(ax_breakdown, breakdown, min_runtime_pct)
+    elif ax_legend is not None and legend_handles:
+        _place_bottom_legend(ax_legend, legend_handles)
 
     fig.subplots_adjust(
         left=0.15 if has_breakdown else 0.13,
         right=0.98,
         top=0.88,
-        bottom=0.01,
+        bottom=0.20,
     )
 
-    fig.savefig(output_file, facecolor="white", pad_inches=0.05)
+    fig.savefig(output_file, facecolor="white", pad_inches=0.15)
     root, ext = os.path.splitext(output_file)
     if ext.lower() == ".pdf":
-        fig.savefig(f"{root}.png", facecolor="white", dpi=200, pad_inches=0.05)
+        fig.savefig(f"{root}.png", facecolor="white", dpi=200, pad_inches=0.15)
     plt.close(fig)
     print(f"Timeline plot saved to '{output_file}'")
 
@@ -770,7 +759,7 @@ if __name__ == "__main__":
         "--breakdown_file",
         type=str,
         default=None,
-        help="JSON from io_profile.py --breakdown; shown as % inset on the timeline",
+        help="JSON from io_profile.py --breakdown; GPU % inset on the timeline",
     )
     parser.add_argument(
         "--min_runtime_pct",
