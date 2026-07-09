@@ -60,7 +60,7 @@ GPU_DISPLAY_ORDER = ["cast", "trsm", "gemm_chol"]
 GPU_BREAKDOWN_COLORS = {
     "cast": "#AA3377",
     "trsm": "#004488",
-    "gemm_chol": "#C75146",
+    "gemm_chol": "#C9A227",
     "other": "#8E44AD",
 }
 ALWAYS_SHOW_BREAKDOWN = frozenset(GPU_DISPLAY_ORDER)
@@ -216,6 +216,44 @@ def _window_from_events(events, pad_frac=0.03):
     end = max(e["start_ms"] + e["dur_ms"] for e in events)
     span = max(end - start, 1.0)
     return start - pad_frac * span, end + pad_frac * span
+
+
+def _event_start_ms(event):
+    return event["start_ms"]
+
+
+def _event_end_ms(event):
+    return event["start_ms"] + event["dur_ms"]
+
+
+def _plot_window_bounds(plot_events, start_candidate, num_candidates, pad_frac=0.03):
+    """Anchor the left edge at GPU start_candidate and I/O start_candidate+1."""
+    anchors = []
+    for event in plot_events:
+        candidate = event.get("candidate")
+        if candidate is None:
+            continue
+        lane = event["lane"]
+        if lane.startswith("gpu") and candidate == start_candidate:
+            anchors.append(_event_start_ms(event))
+        if lane == "io" and candidate == start_candidate + 1:
+            anchors.append(_event_start_ms(event))
+
+    plot_start = min(anchors) if anchors else 0.0
+
+    last_candidate = start_candidate + num_candidates - 1
+    window_events = [
+        e
+        for e in plot_events
+        if e.get("candidate") is not None
+        and start_candidate <= e["candidate"] <= last_candidate + 1
+    ]
+    if not window_events:
+        window_events = list(plot_events)
+
+    plot_end = max(_event_end_ms(e) for e in window_events)
+    span = max(plot_end - plot_start, 1.0)
+    return plot_start, plot_end + pad_frac * span
 
 
 def _candidate_label(candidate):
@@ -483,7 +521,9 @@ def plot_manual_timeline(
     plot_events = _build_plot_events(filtered, events, start_candidate)
     lane_order = [lane for lane in BASE_LANE_ORDER if lane != "main"]
 
-    plot_start, plot_end = _window_from_events(plot_events)
+    plot_start, plot_end = _plot_window_bounds(
+        plot_events, start_candidate, num_candidates
+    )
     visible = [
         e
         for e in plot_events
@@ -530,8 +570,12 @@ def plot_manual_timeline(
     for event in visible:
         lane = event["lane"]
         y = y_positions[lane]
-        left = event["start_ms"] - plot_start
-        width = event["dur_ms"]
+        bar_start_ms = max(event["start_ms"], plot_start)
+        bar_end_ms = min(event["start_ms"] + event["dur_ms"], plot_end)
+        if bar_end_ms <= bar_start_ms:
+            continue
+        left = bar_start_ms - plot_start
+        width = bar_end_ms - bar_start_ms
         color = _event_color(event)
 
         ax.barh(
@@ -549,6 +593,7 @@ def plot_manual_timeline(
         if (
             candidate is not None
             and lane != "main"
+            and candidate >= start_candidate
             and width >= CANDIDATE_LABEL_MIN_MS
         ):
             label = _candidate_label(candidate)
@@ -727,6 +772,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Plot pipelined I/O overlap timeline")
     parser.add_argument(
         "--trace_file",
+        "--trace",
         type=str,
         default="io_overlap_timeline.json",
         help="JSON from io_profile.py --timeline or legacy PyTorch profiler export",

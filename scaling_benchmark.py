@@ -10,6 +10,7 @@ import math
 from tqdm import tqdm
 
 from h5_batch_io import build_si_read_plan, load_ii_block, load_si_column_blocks
+from io_profile import TimelineTracer
 from pipelined_loader import PipelinedLoader
 
 
@@ -19,7 +20,22 @@ def cleanup():
         torch.cuda.empty_cache()
 
 
-def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r_sq, seed_s, seed_candidates):
+def run_benchmark(
+    filename,
+    h5_path,
+    total_candidates,
+    Nt,
+    k,
+    runs,
+    max_evals,
+    r_sq,
+    seed_s,
+    seed_candidates,
+    timeline_file=None,
+    timeline_record_from=0,
+    timeline_start_candidate=0,
+    timeline_num_candidates=10,
+):
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
     size = comm.Get_size()
@@ -164,6 +180,26 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
 
         return MPI.Wtime() - t0
 
+    if rank == 0 and timeline_file:
+        if timeline_record_from < 0 or timeline_record_from >= actual_evals:
+            print(
+                f"Error: --timeline_record_from must be in [0, {actual_evals - 1}], "
+                f"got {timeline_record_from}"
+            )
+            comm.Abort()
+        timeline_capture_from = max(0, timeline_record_from - 1)
+        print(
+            f"Rank-0 overlap timeline: recording on final run "
+            f"(plot window candidates {timeline_record_from}..{actual_evals - 1}, "
+            f"capture from {timeline_capture_from}) -> {timeline_file}"
+        )
+    else:
+        timeline_capture_from = max(0, timeline_record_from - 1)
+
+    timeline_begin_iter = (
+        max(0, timeline_capture_from - 1) if timeline_record_from > 0 else 0
+    )
+
     global_best_io = float("inf")
     global_best_comp = float("inf")
     global_best_wall = float("inf")
@@ -182,10 +218,68 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
         ]
 
         t_wall_start = MPI.Wtime()
-        loader = PipelinedLoader(load_candidate_to_buffer, cuda_device=device)
+
+        timeline_active = rank == 0 and timeline_file is not None and r == runs - 1
+        record_state = None
+        gpu_wall_starts = [0.0, 0.0]
+        io_prefetch_start: dict[int, float] = {}
+
+        if timeline_active:
+            record_state = {
+                "enabled": timeline_capture_from == 0,
+                "tracer": TimelineTracer(),
+            }
+
+        def _sync_and_record_gpu(buf_idx, candidate):
+            gpu_done_events[buf_idx].synchronize()
+            if (
+                not record_state
+                or not record_state["enabled"]
+                or candidate < timeline_capture_from
+            ):
+                return
+            tracer = record_state["tracer"]
+            tracer.record(
+                "gpu",
+                "compute",
+                gpu_wall_starts[buf_idx],
+                tracer.now(),
+                candidate=candidate,
+                buffer=buf_idx,
+            )
+
+        def _begin_recording(c):
+            nonlocal record_state
+            record_state["enabled"] = True
+            record_state["tracer"] = TimelineTracer()
+            loader.tracer = record_state["tracer"]
+            if rank == 0:
+                print(
+                    f"Recording timeline from candidate {timeline_capture_from} "
+                    f"(plot window starts at {timeline_record_from}; loop index {c})."
+                )
+
+        loader = PipelinedLoader(
+            load_candidate_to_buffer,
+            cuda_device=device,
+            tracer=record_state["tracer"] if record_state and record_state["enabled"] else None,
+        )
 
         if actual_evals > 0:
+            if timeline_active and record_state and record_state["enabled"]:
+                io_prefetch_start[0] = record_state["tracer"].now()
             loader.load_sync(0, buf_idx=0)
+            if timeline_active and record_state and record_state["enabled"]:
+                tracer = record_state["tracer"]
+                tracer.record(
+                    "io",
+                    "hdf5_read",
+                    io_prefetch_start[0],
+                    tracer.now(),
+                    candidate=0,
+                    buffer=0,
+                )
+            torch.cuda.synchronize()
 
         for c in tqdm(range(actual_evals), disable=rank != 0):
             curr_b = c % 2
@@ -193,8 +287,27 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
 
             nvtx.range_push(f"Candidate_Loop_{c}")
 
+            if timeline_active and c == timeline_begin_iter and timeline_record_from > 0:
+                _begin_recording(c)
+
             if c > 0:
                 loader.wait()
+                if (
+                    timeline_active
+                    and record_state
+                    and record_state["enabled"]
+                    and c >= timeline_capture_from
+                    and c in io_prefetch_start
+                ):
+                    tracer = record_state["tracer"]
+                    tracer.record(
+                        "io",
+                        "hdf5_read",
+                        io_prefetch_start[c],
+                        tracer.now(),
+                        candidate=c,
+                        buffer=curr_b,
+                    )
 
             if c >= 2:
                 done_b = (c - 2) % 2
@@ -202,13 +315,26 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
                     start_events[done_b].elapsed_time(end_events[done_b]) / 1000.0
                 )
 
+            if timeline_active and record_state and record_state["enabled"]:
+                gpu_wall_starts[curr_b] = record_state["tracer"].now()
+
             # Prefetch on the I/O thread; GPU-buffer sync also runs there.
             if c + 1 < actual_evals:
-                loader.start_async(
-                    c + 1,
-                    buf_idx=next_b,
-                    before_load=gpu_done_events[next_b].synchronize,
-                )
+                gpu_cand = c - 1
+                sync_buf = next_b
+
+                def _before_load(candidate=gpu_cand, buf=sync_buf):
+                    if timeline_active and record_state and record_state["enabled"]:
+                        if candidate >= 0:
+                            _sync_and_record_gpu(buf, candidate)
+                        else:
+                            gpu_done_events[buf].synchronize()
+                    else:
+                        gpu_done_events[buf].synchronize()
+
+                if timeline_active and record_state and record_state["enabled"]:
+                    io_prefetch_start[c + 1] = record_state["tracer"].now()
+                loader.start_async(c + 1, next_b, before_load=_before_load)
 
             # ------------------------------------------------
             # 1. ASYNC GPU PIPELINE (ISOLATED STREAM)
@@ -256,6 +382,40 @@ def run_benchmark(filename, h5_path, total_candidates, Nt, k, runs, max_evals, r
 
         loader.wait()
         torch.cuda.synchronize()
+
+        if timeline_active and record_state and record_state["enabled"]:
+            if actual_evals >= 2:
+                _sync_and_record_gpu((actual_evals - 2) % 2, actual_evals - 2)
+            if actual_evals >= 1:
+                _sync_and_record_gpu((actual_evals - 1) % 2, actual_evals - 1)
+
+            plot_start = (
+                timeline_start_candidate
+                if timeline_start_candidate > 0
+                else timeline_record_from
+            )
+            num_plot = (
+                timeline_num_candidates
+                if timeline_num_candidates > 0
+                else actual_evals - plot_start
+            )
+            record_state["tracer"].export(
+                timeline_file,
+                start_candidate=plot_start,
+                num_candidates=num_plot,
+                focus_candidate=plot_start,
+                timeline_record_from=timeline_record_from,
+                timeline_capture_from=timeline_capture_from,
+                max_evals=actual_evals,
+                k=k,
+                Nt=Nt,
+                mpi_ranks=size,
+                rank0_only=True,
+            )
+            print(
+                f"Wrote rank-0 overlap timeline ({len(record_state['tracer'].events)} events) "
+                f"to {timeline_file}"
+            )
 
         if actual_evals >= 1:
             last_b = (actual_evals - 1) % 2
@@ -333,6 +493,33 @@ if __name__ == "__main__":
         default=256,
         help="Cap the number of evals per rank to prevent excessive runtimes.",
     )
+    parser.add_argument(
+        "--timeline",
+        type=str,
+        default=None,
+        help="Write rank-0 pipelined overlap timeline JSON (recorded on the last run only).",
+    )
+    parser.add_argument(
+        "--timeline_record_from",
+        type=int,
+        default=50,
+        help=(
+            "Plot-window start candidate. Timeline events are captured from "
+            "one candidate earlier (x-1) so the prior GPU stream tail is included."
+        ),
+    )
+    parser.add_argument(
+        "--timeline_start_candidate",
+        type=int,
+        default=0,
+        help="First candidate shown by plot_io_trace.py (0 uses --timeline_record_from).",
+    )
+    parser.add_argument(
+        "--timeline_num_candidates",
+        type=int,
+        default=10,
+        help="Number of candidates in the overlap plot window.",
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -346,4 +533,8 @@ if __name__ == "__main__":
         args.r_sq,
         args.seed_s,
         args.seed_candidates,
+        timeline_file=args.timeline,
+        timeline_record_from=args.timeline_record_from,
+        timeline_start_candidate=args.timeline_start_candidate,
+        timeline_num_candidates=args.timeline_num_candidates,
     )

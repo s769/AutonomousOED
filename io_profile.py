@@ -441,10 +441,15 @@ def run_timeline(
             f"got {timeline_record_from}"
         )
 
+    timeline_capture_from = max(0, timeline_record_from - 1)
+    timeline_begin_iter = (
+        max(0, timeline_capture_from - 1) if timeline_record_from > 0 else 0
+    )
+
     ctx = _setup_pipeline(h5_path, Nt, k, max_evals, r_sq, precision)
 
     tracer = TimelineTracer()
-    record_state = {"enabled": timeline_record_from == 0, "tracer": tracer}
+    record_state = {"enabled": timeline_capture_from == 0, "tracer": tracer}
     total_bytes_read = 0
     gpu_wall_starts = [0.0, 0.0]
     io_prefetch_start: dict[int, float] = {}
@@ -454,11 +459,14 @@ def run_timeline(
         record_state["enabled"] = True
         record_state["tracer"] = TimelineTracer()
         loader.tracer = record_state["tracer"]
-        print(f"Recording timeline from candidate {c} (warmup complete).")
+        print(
+            f"Recording timeline from candidate {timeline_capture_from} "
+            f"(plot window starts at {timeline_record_from}; loop index {c})."
+        )
 
     def _sync_and_record_gpu(buf_idx, candidate):
         ctx["gpu_done_events"][buf_idx].synchronize()
-        if not record_state["enabled"] or candidate < timeline_record_from:
+        if not record_state["enabled"] or candidate < timeline_capture_from:
             return
         t_end = record_state["tracer"].now()
         record_state["tracer"].record(
@@ -497,14 +505,16 @@ def run_timeline(
 
     if timeline_record_from > 0:
         print(
-            f"\nRunning {timeline_record_from} warmup evals, then capturing overlap "
-            f"timeline through candidate {max_evals - 1}..."
+            f"\nRunning {timeline_begin_iter} warmup evals, then capturing overlap "
+            f"timeline from candidate {timeline_capture_from} through "
+            f"candidate {max_evals - 1} (plot window starts at "
+            f"{timeline_record_from})..."
         )
     else:
         print(f"\nCapturing overlap timeline for {max_evals} candidates...")
 
     for c in tqdm(range(max_evals)):
-        if c == timeline_record_from and timeline_record_from > 0:
+        if c == timeline_begin_iter and timeline_record_from > 0:
             _begin_recording(c)
 
         curr_b = c % 2
@@ -514,7 +524,7 @@ def run_timeline(
             loader.wait()
             if (
                 record_state["enabled"]
-                and c >= timeline_record_from
+                and c >= timeline_capture_from
                 and c in io_prefetch_start
             ):
                 record_state["tracer"].record(
@@ -562,6 +572,7 @@ def run_timeline(
         num_candidates=num_plot_candidates,
         focus_candidate=plot_start,
         timeline_record_from=timeline_record_from,
+        timeline_capture_from=timeline_capture_from,
         max_evals=max_evals,
         k=k,
         Nt=Nt,
@@ -572,7 +583,8 @@ def run_timeline(
         trace_file,
         extra_lines=[
             f"Events recorded     : {len(record_state['tracer'].events)}",
-            f"Recording started at: candidate {timeline_record_from}",
+            f"Plot window starts  : candidate {timeline_record_from}",
+            f"Capture starts at   : candidate {timeline_capture_from}",
         ],
     )
 
@@ -723,7 +735,10 @@ if __name__ == "__main__":
         "--timeline_record_from",
         type=int,
         default=0,
-        help="Skip initial candidates and start timeline recording here (warmup mode)",
+        help=(
+            "Plot-window start candidate. Timeline events are captured from "
+            "one candidate earlier (x-1) so the prior GPU stream tail is included."
+        ),
     )
     parser.add_argument(
         "--focus_candidate",
