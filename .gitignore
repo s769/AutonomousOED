@@ -20,3 +20,4 @@ __pycache__/
 *.json
 
 scaling_results/
+scaling_results_trip/
