@@ -135,28 +135,50 @@ def _events_for_plot(events, start_candidate, num_candidates=None):
 
 
 def _merge_io_events(events):
-    by_candidate: dict[int, dict] = {}
+    """Build one I/O bar per candidate showing actual HDF5 read time only.
+
+    When gpu_buffer_wait is present, the gray bar starts after that wait ends
+    (prefetch may begin earlier, but the wait is not filesystem I/O).
+    Legacy traces with only hdf5_read keep that event as recorded.
+    """
+    by_candidate: dict[int, list] = {}
     for e in events:
         if e["lane"] != "io":
             continue
-        c = e["candidate"]
-        end_ms = e["start_ms"] + e["dur_ms"]
-        if c not in by_candidate:
-            by_candidate[c] = {"start_ms": e["start_ms"], "end_ms": end_ms, "candidate": c}
-        else:
-            by_candidate[c]["start_ms"] = min(by_candidate[c]["start_ms"], e["start_ms"])
-            by_candidate[c]["end_ms"] = max(by_candidate[c]["end_ms"], end_ms)
+        by_candidate.setdefault(e["candidate"], []).append(e)
 
-    return [
-        {
-            "lane": "io",
-            "name": "hdf5_io",
-            "start_ms": span["start_ms"],
-            "dur_ms": span["end_ms"] - span["start_ms"],
-            "candidate": span["candidate"],
-        }
-        for span in sorted(by_candidate.values(), key=lambda item: item["candidate"])
-    ]
+    bars = []
+    for candidate, evs in sorted(by_candidate.items()):
+        waits = [e for e in evs if e["name"] == "gpu_buffer_wait"]
+        reads = [e for e in evs if e["name"] == "hdf5_read"]
+        if not reads and not waits:
+            continue
+
+        if reads and waits:
+            wait_end = max(e["start_ms"] + e["dur_ms"] for e in waits)
+            read_end = max(e["start_ms"] + e["dur_ms"] for e in reads)
+            start_ms = wait_end
+            end_ms = read_end
+        elif reads:
+            start_ms = min(e["start_ms"] for e in reads)
+            end_ms = max(e["start_ms"] + e["dur_ms"] for e in reads)
+        else:
+            start_ms = min(e["start_ms"] for e in waits)
+            end_ms = max(e["start_ms"] + e["dur_ms"] for e in waits)
+
+        dur_ms = end_ms - start_ms
+        if dur_ms <= 0:
+            continue
+        bars.append(
+            {
+                "lane": "io",
+                "name": "hdf5_io",
+                "start_ms": start_ms,
+                "dur_ms": dur_ms,
+                "candidate": candidate,
+            }
+        )
+    return bars
 
 
 def _main_covers_interval(main_events, candidate, start_ms, end_ms):
