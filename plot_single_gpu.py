@@ -13,6 +13,7 @@ FILE_A100 = DATA_DIR / "single_gpu_results_a100.csv"
 FILE_MI250X = DATA_DIR / "single_gpu_results_mi250x.csv"
 FILE_GH200 = DATA_DIR / "single_gpu_results_gh200.csv"
 FILE_GB200 = DATA_DIR / "single_gpu_results_gb200.csv"
+FILE_MI300X = DATA_DIR / "single_gpu_results_mi300x.csv"
 
 FIT_K_MIN = 50
 THEORY_ANCHOR_K = 100
@@ -23,6 +24,7 @@ LEGEND_SHORT_NAMES = {
     "NVIDIA A100": "A100",
     "NVIDIA GH200": "GH200",
     "NVIDIA GB200": "GB200",
+    "NVIDIA MI300X": "MI300X",
 }
 
 # ==========================================
@@ -43,6 +45,7 @@ c_mi250 = cb[1]
 c_a100 = cb[0]
 c_gh200 = cb[2]
 c_gb200 = cb[3]
+c_mi300x = cb[4]
 c_theory = "#666666"
 
 fig_size = (5.0, 4.0)
@@ -61,12 +64,13 @@ df_mi250 = load_data(FILE_MI250X)
 df_a100 = load_data(FILE_A100)
 df_gh200 = load_data(FILE_GH200)
 df_gb200 = load_data(FILE_GB200)
-
+df_mi300x = load_data(FILE_MI300X)
 architectures = [
     (df_mi250, c_mi250, "AMD MI250X"),
     (df_a100, c_a100, "NVIDIA A100"),
     (df_gh200, c_gh200, "NVIDIA GH200"),
     (df_gb200, c_gb200, "NVIDIA GB200"),
+    (df_mi300x, c_mi300x, "NVIDIA MI300X"),
 ]
 
 

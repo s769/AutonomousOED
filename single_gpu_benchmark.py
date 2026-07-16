@@ -12,6 +12,18 @@ def cleanup():
         torch.cuda.empty_cache()
 
 
+def _trsm_leading_size(n, pad_when_mult_of_128):
+    """Return TRSM leading dimension, optionally bumping multiples of 128 by 1.
+
+    Some hipBLAS builds misbehave when the triangular size is a multiple of
+    128. The workaround is to solve a (n+1) system and slice the result back
+    to n. Leave this off for cuBLAS.
+    """
+    if pad_when_mult_of_128 and n > 0 and n % 128 == 0:
+        return n + 1
+    return n
+
+
 def _load_csv_rows(filename):
     """Load benchmark rows from CSV if available."""
     if not os.path.isfile(filename):
@@ -26,7 +38,7 @@ def _load_csv_rows(filename):
     return existing_data
 
 
-def run_benchmark(filename, Nt, max_budget, step, runs):
+def run_benchmark(filename, Nt, max_budget, step, runs, pad_trsm_mult128=False):
     if not torch.cuda.is_available():
         raise RuntimeError(
             "CUDA is not available! This benchmark requires an active GPU."
@@ -49,6 +61,12 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
         except Exception as e:
             print(f"Could not read existing file: {e}. Starting from scratch.")
 
+    if pad_trsm_mult128:
+        print(
+            "TRSM pad-when-mult-of-128: ON "
+            "(Schur paths use n+1 then slice when k*Nt % 128 == 0)"
+        )
+
     print(
         f"{'k':<4} | {'Mem: N-OOP':<10} | {'N-IP':<8} | {'S-OOP':<8} | {'S-IP':<8} || {'Time: N-OOP':<11} | {'N-IP':<8} | {'S-OOP':<8} | {'S-IP':<8}"
     )
@@ -65,6 +83,8 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
     with torch.no_grad():
         for k in range(10, max_budget + 1, step):
             current_size = k * Nt
+            trsm_size = _trsm_leading_size(current_size, pad_trsm_mult128)
+            pad_trsm = trsm_size != current_size
 
             # Initialize defaults
             vals = {
@@ -256,11 +276,15 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                 cleanup()
                 torch.cuda.reset_peak_memory_stats()
                 try:
-                    L_S, K_Si, K_ii = (
-                        L_S_cpu.to(device),
-                        K_Si_cpu.to(device),
-                        K_ii_cpu.to(device),
-                    )
+                    K_ii = K_ii_cpu.to(device)
+                    if pad_trsm:
+                        # hipBLAS workaround: TRSM at n+1, then use Y[:n].
+                        L_S = torch.eye(trsm_size, dtype=dtype, device=device)
+                        K_Si = torch.zeros(
+                            (trsm_size, Nt), dtype=dtype, device=device
+                        )
+                    else:
+                        L_S, K_Si = L_S_cpu.to(device), K_Si_cpu.to(device)
 
                     # Pre-allocate all distinct buffers
                     dummy_L = torch.empty((Nt, Nt), dtype=dtype, device=device)
@@ -270,7 +294,8 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
 
                     # Peak Memory Run
                     torch.linalg.solve_triangular(L_S, K_Si, upper=False, out=Y)
-                    torch.addmm(K_ii, Y.T, Y, alpha=-1.0, beta=1.0, out=M)
+                    Y_n = Y[:current_size]
+                    torch.addmm(K_ii, Y_n.T, Y_n, alpha=-1.0, beta=1.0, out=M)
                     torch.linalg.cholesky_ex(M, out=(dummy_L, dummy_info))
 
                     vals["m_so"] = torch.cuda.max_memory_allocated() / (1024**3)
@@ -280,7 +305,8 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                     for _ in range(runs):
                         start_event.record()
                         torch.linalg.solve_triangular(L_S, K_Si, upper=False, out=Y)
-                        torch.addmm(K_ii, Y.T, Y, alpha=-1.0, beta=1.0, out=M)
+                        Y_n = Y[:current_size]
+                        torch.addmm(K_ii, Y_n.T, Y_n, alpha=-1.0, beta=1.0, out=M)
                         torch.linalg.cholesky_ex(
                             M, check_errors=False, out=(dummy_L, dummy_info)
                         )
@@ -291,7 +317,7 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
 
                 except torch.cuda.OutOfMemoryError:
                     oom_s_oop = True
-                L_S = K_Si = K_ii = Y = M = dummy_L = dummy_info = None
+                L_S = K_Si = K_ii = Y = M = dummy_L = dummy_info = Y_n = None
 
             # ==========================================
             # 4. SCHUR STRICT IN-PLACE (S-IP)
@@ -300,11 +326,14 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                 cleanup()
                 torch.cuda.reset_peak_memory_stats()
                 try:
-                    L_S, K_Si, K_ii = (
-                        L_S_cpu.to(device),
-                        K_Si_cpu.to(device),
-                        K_ii_cpu.to(device),
-                    )
+                    K_ii = K_ii_cpu.to(device)
+                    if pad_trsm:
+                        L_S = torch.eye(trsm_size, dtype=dtype, device=device)
+                        K_Si = torch.zeros(
+                            (trsm_size, Nt), dtype=dtype, device=device
+                        )
+                    else:
+                        L_S, K_Si = L_S_cpu.to(device), K_Si_cpu.to(device)
 
                     dummy_info = torch.empty((), dtype=torch.int32, device=device)
                     K_Si_tmp = K_Si.clone()
@@ -314,7 +343,8 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                     torch.linalg.solve_triangular(
                         L_S, K_Si_tmp, upper=False, out=K_Si_tmp
                     )
-                    K_ii_tmp.addmm_(K_Si_tmp.T, K_Si_tmp, alpha=-1.0, beta=1.0)
+                    Y_n = K_Si_tmp[:current_size]
+                    K_ii_tmp.addmm_(Y_n.T, Y_n, alpha=-1.0, beta=1.0)
                     torch.linalg.cholesky_ex(K_ii_tmp, out=(K_ii_tmp, dummy_info))
 
                     vals["m_si"] = torch.cuda.max_memory_allocated() / (1024**3)
@@ -329,7 +359,8 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
                         torch.linalg.solve_triangular(
                             L_S, K_Si_tmp, upper=False, out=K_Si_tmp
                         )
-                        K_ii_tmp.addmm_(K_Si_tmp.T, K_Si_tmp, alpha=-1.0, beta=1.0)
+                        Y_n = K_Si_tmp[:current_size]
+                        K_ii_tmp.addmm_(Y_n.T, Y_n, alpha=-1.0, beta=1.0)
                         torch.linalg.cholesky_ex(
                             K_ii_tmp, check_errors=False, out=(K_ii_tmp, dummy_info)
                         )
@@ -341,12 +372,13 @@ def run_benchmark(filename, Nt, max_budget, step, runs):
 
                 except torch.cuda.OutOfMemoryError:
                     oom_s_ip = True
-                L_S = K_Si = K_ii = K_Si_tmp = K_ii_tmp = dummy_info = None
+                L_S = K_Si = K_ii = K_Si_tmp = K_ii_tmp = dummy_info = Y_n = None
 
             L_S_cpu = K_Si_cpu = K_ii_cpu = None
 
+            pad_tag = " (TRSM n+1)" if pad_trsm else ""
             print(
-                f"{k:<4} | {vals['m_no']:<10.3f} | {vals['m_ni']:<8.3f} | {vals['m_so']:<8.3f} | {vals['m_si']:<8.3f} || {vals['t_no']:<11.3f} | {vals['t_ni']:<8.3f} | {vals['t_so']:<8.3f} | {vals['t_si']:<8.3f}"
+                f"{k:<4} | {vals['m_no']:<10.3f} | {vals['m_ni']:<8.3f} | {vals['m_so']:<8.3f} | {vals['m_si']:<8.3f} || {vals['t_no']:<11.3f} | {vals['t_ni']:<8.3f} | {vals['t_so']:<8.3f} | {vals['t_si']:<8.3f}{pad_tag}"
             )
 
             row = [
@@ -376,6 +408,15 @@ if __name__ == "__main__":
     parser.add_argument("--max_budget", type=int, default=600)
     parser.add_argument("--step", type=int, default=10)
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument(
+        "--pad_trsm_mult128",
+        action="store_true",
+        help=(
+            "hipBLAS workaround: when k*Nt is a multiple of 128, run Schur "
+            "solve_triangular at size n+1 and slice the result back to n. "
+            "Leave off for cuBLAS."
+        ),
+    )
     args = parser.parse_args()
 
     run_benchmark(
@@ -384,4 +425,5 @@ if __name__ == "__main__":
         max_budget=args.max_budget,
         step=args.step,
         runs=args.runs,
+        pad_trsm_mult128=args.pad_trsm_mult128,
     )

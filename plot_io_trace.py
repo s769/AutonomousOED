@@ -4,6 +4,7 @@ import os
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.patches import Polygon
 import seaborn as sns
 
 # --- Paper styling ---
@@ -15,6 +16,14 @@ plt.rcParams["axes.labelweight"] = "bold"
 BAR_HEIGHT = 0.5
 MAIN_MIN_MS = 1.0
 CANDIDATE_LABEL_MIN_MS = 40.0
+# Bars that extend past the plot window get a zigzag on the clipped side.
+EDGE_CLIP_EPS_MS = 0.5
+BAR_EDGE_LW = 0.6
+ZIGZAG_TEETH = 4
+# Zigzag amplitude as a fraction of the visible time span.
+ZIGZAG_AMP_FRAC = 0.012
+ZIGZAG_AMP_MIN_MS = 6.0
+ZIGZAG_AMP_MAX_MS = 14.0
 
 BASE_LANE_ORDER = ["main", "io", "gpu0", "gpu1"]
 LANE_LABELS = {
@@ -28,6 +37,7 @@ IO_COLOR = "#B8B8B8"
 MAIN_COLORS = {
     "wait_for_io": "#D35400",
     "await_dispatch": "#E67E22",
+    "trsm_host": "#5B2C6F",
 }
 GPU_COLORS = {
     "gpu0": "#2E8B57",
@@ -36,10 +46,11 @@ GPU_COLORS = {
 
 IO_SIMPLE_NAMES = {"gpu_buffer_wait", "hdf5_read"}
 GPU_AGGREGATE = "compute"
-MAIN_EVENT_NAMES = {"wait_for_io", "await_dispatch"}
+MAIN_EVENT_NAMES = {"wait_for_io", "await_dispatch", "trsm_host"}
 MAIN_LABELS = {
     "wait_for_io": "Wait for prefetch",
     "await_dispatch": "Ready → launch",
+    "trsm_host": "TRSM (host)",
 }
 
 GPU_BREAKDOWN_MERGE = {
@@ -102,12 +113,19 @@ def _load_breakdown(path):
 
 
 def _events_for_plot(events, start_candidate, num_candidates=None):
-    """GPU: candidates [x-1, x+3]; I/O and main: candidates [x, x+4]."""
+    """Select events for the timeline window.
+
+    GPU: [x-1, x+4]; main: [x, x+4]; I/O: [x, x+5].
+    The time axis is anchored on [x, x+3], so x-1 / late I/O or compute may
+    clip at the edges.
+    """
     del num_candidates
     gpu_min = start_candidate - 1 if start_candidate > 0 else start_candidate
-    gpu_max = start_candidate + 3
+    gpu_max = start_candidate + 4
     io_min = start_candidate
-    io_max = start_candidate + 4
+    io_max = start_candidate + 5
+    main_min = start_candidate
+    main_max = start_candidate + 4
 
     selected = []
     for e in events:
@@ -120,7 +138,7 @@ def _events_for_plot(events, start_candidate, num_candidates=None):
                 selected.append(e)
         elif (
             e["lane"] == "main"
-            and io_min <= c <= io_max
+            and main_min <= c <= main_max
             and e["name"] in MAIN_EVENT_NAMES
             and e["dur_ms"] >= MAIN_MIN_MS
         ):
@@ -194,7 +212,7 @@ def _main_covers_interval(main_events, candidate, start_ms, end_ms):
 
 def _fill_dispatch_gaps(io_bars, all_events, main_events, start_candidate):
     gpu_min = start_candidate - 1 if start_candidate > 0 else start_candidate
-    gpu_max = start_candidate + 3
+    gpu_max = start_candidate + 4
     gpu_by_candidate = {
         e["candidate"]: e
         for e in all_events
@@ -249,7 +267,11 @@ def _event_end_ms(event):
 
 
 def _plot_window_bounds(plot_events, start_candidate, num_candidates, pad_frac=0.03):
-    """Anchor the left edge at GPU start_candidate and I/O start_candidate+1."""
+    """Anchor left at GPU x / I/O x+1; right from the [x, x+3] core window.
+
+    Events for x-1 and x+4 are drawn but may clip at the axis edges.
+    """
+    del num_candidates
     anchors = []
     for event in plot_events:
         candidate = event.get("candidate")
@@ -263,12 +285,13 @@ def _plot_window_bounds(plot_events, start_candidate, num_candidates, pad_frac=0
 
     plot_start = min(anchors) if anchors else 0.0
 
-    last_candidate = start_candidate + num_candidates - 1
+    # Core window ends at x+3 so x+4 can overhang the right edge.
+    core_max = start_candidate + 3
     window_events = [
         e
         for e in plot_events
         if e.get("candidate") is not None
-        and start_candidate <= e["candidate"] <= last_candidate + 1
+        and start_candidate <= e["candidate"] <= core_max
     ]
     if not window_events:
         window_events = list(plot_events)
@@ -278,8 +301,14 @@ def _plot_window_bounds(plot_events, start_candidate, num_candidates, pad_frac=0
     return plot_start, plot_end + pad_frac * span
 
 
-def _candidate_label(candidate):
-    return f"Candidate {candidate}"
+def _candidate_label(candidate, *, full=False):
+    """In-bar labels use bare ids so short I/O bars don't overflow.
+
+    Keep the full 'Candidate N' form for panel titles / captions only.
+    """
+    if full:
+        return f"Candidate {candidate}"
+    return str(candidate)
 
 
 def _gpu_plot_lane(event):
@@ -295,6 +324,55 @@ def _lane_y_positions(lane_order):
     }
 
 
+def _zigzag_edge(x, y0, y1, amp, inward_positive, n_teeth=ZIGZAG_TEETH):
+    """Polyline for a torn vertical edge; teeth point into the bar."""
+    n_pts = 2 * n_teeth + 1
+    ys = [y0 + (y1 - y0) * i / (n_pts - 1) for i in range(n_pts)]
+    sign = 1.0 if inward_positive else -1.0
+    xs = [x + (sign * amp if i % 2 else 0.0) for i in range(n_pts)]
+    return list(zip(xs, ys))
+
+
+def _draw_timeline_bar(
+    ax, left, width, y, height, color, clipped_left, clipped_right, zigzag_amp
+):
+    """Draw a timeline bar; clipped sides get an inward zigzag edge."""
+    half = height / 2.0
+    y0, y1 = y - half, y + half
+    right = left + width
+    amp = min(zigzag_amp, max(width * 0.35, 0.0))
+
+    verts = []
+    # Bottom edge, left → right
+    verts.append((left, y0))
+    verts.append((right, y0))
+    # Right edge
+    if clipped_right and amp > 0:
+        verts.extend(_zigzag_edge(right, y0, y1, amp, inward_positive=False)[1:])
+    else:
+        verts.append((right, y1))
+    # Top edge, right → left
+    verts.append((left, y1))
+    # Left edge (top → bottom); reverse zigzag so winding stays consistent
+    if clipped_left and amp > 0:
+        left_edge = _zigzag_edge(left, y1, y0, amp, inward_positive=True)
+        verts.extend(left_edge[1:])
+    else:
+        verts.append((left, y0))
+
+    ax.add_patch(
+        Polygon(
+            verts,
+            closed=True,
+            facecolor=color,
+            edgecolor="black",
+            linewidth=BAR_EDGE_LW,
+            zorder=1,
+            clip_on=True,
+        )
+    )
+
+
 def _event_color(event):
     lane = event["lane"]
     name = event.get("name")
@@ -308,20 +386,34 @@ def _event_color(event):
 
 
 def _build_plot_events(filtered, all_events, start_candidate):
-    del all_events, start_candidate
     io_raw = [e for e in filtered if e["lane"] == "io"]
     io_plot = _merge_io_events(io_raw)
+    main_raw = [e for e in filtered if e["lane"] == "main"]
+    main_plot = _fill_dispatch_gaps(io_plot, all_events, main_raw, start_candidate)
     gpu_plot = [
         {**e, "lane": _gpu_plot_lane(e)}
         for e in filtered
         if e["lane"] == "gpu" and e["name"] == GPU_AGGREGATE
     ]
-    return io_plot + gpu_plot
+    return io_plot + main_plot + gpu_plot
 
 
 def _legend_handles(visible):
-    del visible
-    return []
+    names_seen = {e.get("name") for e in visible if e.get("lane") == "main"}
+    handles = []
+    if "trsm_host" in names_seen:
+        handles.append(_rect_handle(MAIN_COLORS["trsm_host"], MAIN_LABELS["trsm_host"]))
+    if "wait_for_io" in names_seen:
+        handles.append(
+            _rect_handle(MAIN_COLORS["wait_for_io"], MAIN_LABELS["wait_for_io"])
+        )
+    if "await_dispatch" in names_seen:
+        handles.append(
+            _rect_handle(MAIN_COLORS["await_dispatch"], MAIN_LABELS["await_dispatch"])
+        )
+    handles.append(_rect_handle(IO_COLOR, "HDF5 read"))
+    handles.append(_rect_handle(GPU_COLORS["gpu0"], "GPU compute"))
+    return handles
 
 
 def _consolidate_ms(ms_dict, merge_map):
@@ -465,7 +557,7 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
     ax.set_xticks(range(0, 101, 5), minor=True)
     ax.set_xticklabels(["0", "25", "50", "75", "100"], fontsize=6.5)
     ax.set_xlabel(
-        f"GPU Runtime Breakdown (%)\n— {_candidate_label(candidate)}",
+        f"GPU Runtime Breakdown (%)\n— {_candidate_label(candidate, full=True)}",
         fontsize=7,
         fontweight="bold",
         labelpad=10,
@@ -536,12 +628,14 @@ def plot_manual_timeline(
     if not filtered:
         raise ValueError(
             f"No events found for start_candidate={start_candidate} "
-            f"(GPU {max(0, start_candidate - 1)}–{start_candidate + 3}, "
-            f"I/O {start_candidate}–{start_candidate + 4})."
+            f"(GPU {max(0, start_candidate - 1)}–{start_candidate + 4}, "
+            f"main {start_candidate}–{start_candidate + 4}, "
+            f"I/O {start_candidate}–{start_candidate + 5})."
         )
 
     plot_events = _build_plot_events(filtered, events, start_candidate)
-    lane_order = [lane for lane in BASE_LANE_ORDER if lane != "main"]
+    present_lanes = {e["lane"] for e in plot_events}
+    lane_order = [lane for lane in BASE_LANE_ORDER if lane in present_lanes]
 
     plot_start, plot_end = _plot_window_bounds(
         plot_events, start_candidate, num_candidates
@@ -552,7 +646,7 @@ def plot_manual_timeline(
         if e["start_ms"] + e["dur_ms"] >= plot_start and e["start_ms"] <= plot_end
     ]
 
-    fig_height = 2.2
+    fig_height = 2.2 + (0.55 if "main" in present_lanes else 0.0)
     has_breakdown = breakdown is not None and breakdown.get("gpu_ms")
     label_row = 0.16   # spacer for x-axis labels below the plot
     legend_row = 0.16 if legend_y is None else max(0.10, legend_y)
@@ -588,38 +682,55 @@ def plot_manual_timeline(
         ax_legend.axis("off")
 
     y_positions = _lane_y_positions(lane_order)
+    plot_span = max(plot_end - plot_start, 1.0)
+    zigzag_amp = min(
+        ZIGZAG_AMP_MAX_MS,
+        max(ZIGZAG_AMP_MIN_MS, ZIGZAG_AMP_FRAC * plot_span),
+    )
 
     for event in visible:
         lane = event["lane"]
         y = y_positions[lane]
+        event_end_ms = event["start_ms"] + event["dur_ms"]
         bar_start_ms = max(event["start_ms"], plot_start)
-        bar_end_ms = min(event["start_ms"] + event["dur_ms"], plot_end)
+        bar_end_ms = min(event_end_ms, plot_end)
         if bar_end_ms <= bar_start_ms:
             continue
         left = bar_start_ms - plot_start
         width = bar_end_ms - bar_start_ms
         color = _event_color(event)
+        clipped_left = event["start_ms"] < plot_start - EDGE_CLIP_EPS_MS
+        clipped_right = event_end_ms > plot_end + EDGE_CLIP_EPS_MS
 
-        ax.barh(
-            y,
+        _draw_timeline_bar(
+            ax,
+            left,
             width,
-            left=left,
-            height=BAR_HEIGHT,
-            color=color,
-            edgecolor="black",
-            linewidth=0.6,
-            zorder=1,
+            y,
+            BAR_HEIGHT,
+            color,
+            clipped_left,
+            clipped_right,
+            zigzag_amp,
         )
 
         candidate = event.get("candidate")
-        if (
-            candidate is not None
-            and lane != "main"
-            and candidate >= start_candidate
-            and width >= CANDIDATE_LABEL_MIN_MS
-        ):
+        # Label in-window bars; also label a left-clipped prior GPU compute
+        # (x-1), but skip cut-off I/O stubs.
+        label_ok = False
+        if candidate is not None and width >= CANDIDATE_LABEL_MIN_MS:
+            if lane == "io" and (clipped_left or clipped_right):
+                label_ok = False
+            elif candidate >= start_candidate:
+                label_ok = True
+            elif lane.startswith("gpu") and clipped_left:
+                label_ok = True
+        if label_ok:
             label = _candidate_label(candidate)
-            text_color = "black" if lane == "io" else "white"
+            if lane == "io":
+                text_color = "black"
+            else:
+                text_color = "white"
             ax.text(
                 left + width / 2,
                 y,
@@ -642,6 +753,7 @@ def plot_manual_timeline(
 
     ax.grid(True, **MAIN_GRID)
     ax.set_ylim(0, BAR_HEIGHT * len(lane_order))
+    ax.set_xlim(0, plot_end - plot_start)
 
     legend_handles = _legend_handles(visible)
     if has_breakdown:

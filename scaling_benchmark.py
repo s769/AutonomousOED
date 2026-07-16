@@ -352,9 +352,22 @@ def run_benchmark(
                 start_events[curr_b].record(streams[curr_b])
 
                 K_Si_gpu_math[curr_b].mul_(r_sq)
+                # Host wall time inside solve_triangular: large TRSMs often block
+                # the calling thread even though work is enqueued on a side stream.
+                if timeline_active and record_state and record_state["enabled"]:
+                    trsm_host_t0 = record_state["tracer"].now()
                 torch.linalg.solve_triangular(
                     L_S, K_Si_gpu_math[curr_b], upper=False, out=K_Si_gpu_math[curr_b]
                 )
+                if timeline_active and record_state and record_state["enabled"]:
+                    record_state["tracer"].record(
+                        "main",
+                        "trsm_host",
+                        trsm_host_t0,
+                        record_state["tracer"].now(),
+                        candidate=c,
+                        buffer=curr_b,
+                    )
 
                 K_ii_gpu_math[curr_b].mul_(r_sq).diagonal().add_(1.0)
                 K_ii_gpu_math[curr_b].addmm_(
