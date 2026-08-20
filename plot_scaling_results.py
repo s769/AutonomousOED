@@ -199,7 +199,7 @@ def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=Fals
     custom_legend = [
         Line2D([0], [0], color=color_pm, lw=3, marker="o", ms=8, label="Perlmutter"),
         Line2D([0], [0], color=color_fr, lw=3, marker="s", ms=8, label="Frontier"),
-        Line2D([0], [0], color="black", lw=3, linestyle="-", label="Observed"),
+        # Line2D([0], [0], color="black", lw=3, linestyle="-", label="Observed"),
         Line2D([0], [0], color="black", lw=2, linestyle="--", label="Ideal"),
     ]
 

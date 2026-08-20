@@ -4,6 +4,7 @@ import os
 
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
+from matplotlib.lines import Line2D
 from matplotlib.patches import Polygon
 import seaborn as sns
 
@@ -12,6 +13,11 @@ sns.set_context("paper", font_scale=1.3)
 sns.set_style("whitegrid")
 plt.rcParams["font.weight"] = "bold"
 plt.rcParams["axes.labelweight"] = "bold"
+
+LABEL_FONTSIZE = plt.rcParams["axes.labelsize"]
+TICK_FONTSIZE = plt.rcParams["xtick.labelsize"]
+LEGEND_FONTSIZE = 9
+BAR_ANNOT_FONTSIZE = 8.5
 
 BAR_HEIGHT = 0.5
 MAIN_MIN_MS = 1.0
@@ -27,7 +33,7 @@ ZIGZAG_AMP_MAX_MS = 14.0
 
 BASE_LANE_ORDER = ["main", "io", "gpu0", "gpu1"]
 LANE_LABELS = {
-    "io": "I/O",
+    "io": "I/O Thread",
     "main": "Main Thread",
     "gpu0": "GPU Stream 0",
     "gpu1": "GPU Stream 1",
@@ -77,9 +83,9 @@ GPU_BREAKDOWN_COLORS = {
 ALWAYS_SHOW_BREAKDOWN = frozenset(GPU_DISPLAY_ORDER)
 BREAKDOWN_LABELS = {
     "hdf5_read": "HDF5 Read",
-    "cast": "Cast + Preprocess",
-    "trsm": "TRSM",
-    "gemm_chol": "GEMM + Cholesky",
+    "cast": "Preprocess",
+    "trsm": "Triangular Solve",
+    "gemm_chol": "Cholesky + Schur Complement",
     "other_gpu": "Misc. GPU",
     **MAIN_LABELS,
 }
@@ -516,6 +522,36 @@ def _breakdown_legend_handles(rows):
     return handles
 
 
+def _underline_legend_title(fig, legend, linewidth=0.9, pad_pts=1.2):
+    """Draw a rule under the legend title (native-font text has no underline)."""
+    line = Line2D(
+        [0.0, 0.0],
+        [0.0, 0.0],
+        transform=fig.transFigure,
+        color="black",
+        linewidth=linewidth,
+        clip_on=False,
+        solid_capstyle="butt",
+        visible=False,
+    )
+    fig.add_artist(line)
+
+    def _sync(event):
+        if event.canvas is not fig.canvas:
+            return
+        renderer = event.renderer
+        bbox = legend.get_title().get_window_extent(renderer=renderer)
+        y_display = bbox.y0 - pad_pts * fig.dpi / 72.0
+        inv = fig.transFigure.inverted()
+        x0, y0 = inv.transform((bbox.x0, y_display))
+        x1, y1 = inv.transform((bbox.x1, y_display))
+        line.set_data([x0, x1], [y0, y1])
+        line.set_visible(True)
+        line.draw(renderer)
+
+    fig.canvas.mpl_connect("draw_event", _sync)
+
+
 def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
     rows = _breakdown_rows(breakdown, min_runtime_pct)
     if not rows:
@@ -523,8 +559,8 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
         return
 
     candidate = breakdown.get("candidate", "?")
-    y_center = 0.25
-    bar_h = 0.42
+    y_center = 0.20
+    bar_h = 0.28
     for _, labels, values, facecolors in rows:
         display_widths = _display_bar_widths(values)
         left = 0.0
@@ -545,7 +581,7 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
                     f"{value:.0f}%",
                     ha="center",
                     va="center",
-                    fontsize=6,
+                    fontsize=BAR_ANNOT_FONTSIZE,
                     fontweight="bold",
                     color="white" if value > 20 else "black",
                 )
@@ -555,32 +591,37 @@ def _draw_breakdown_panel(ax, breakdown, min_runtime_pct):
     ax.set_ylim(0, 0.72)
     ax.set_xticks([0, 25, 50, 75, 100])
     ax.set_xticks(range(0, 101, 5), minor=True)
-    ax.set_xticklabels(["0", "25", "50", "75", "100"], fontsize=6.5)
     ax.set_xlabel(
-        f"GPU Runtime Breakdown (%)\n— {_candidate_label(candidate, full=True)}",
-        fontsize=7,
+        "GPU Runtime Breakdown (%)",
         fontweight="bold",
+        fontsize=LABEL_FONTSIZE,
         labelpad=10,
     )
     ax.set_yticks([])
-    for spine in ("top", "right", "left"):
+    ax.tick_params(colors="black", pad=2, labelsize=TICK_FONTSIZE)
+    for spine in ("right", "left"):
         ax.spines[spine].set_visible(False)
+    ax.spines["top"].set_visible(True)
     ax.grid(True, which="major", **BREAKDOWN_MAJOR_GRID)
     ax.grid(True, which="minor", axis="x", alpha=0.15, color="gray", linestyle=":")
 
     handles = _breakdown_legend_handles(rows)
     if handles:
-        ax.legend(
+        legend = ax.legend(
             [h for h in handles],
             [h.get_label() for h in handles],
-            loc="upper right",
+            loc="upper center",
             ncol=1,
-            fontsize=6,
+            fontsize=LEGEND_FONTSIZE,
+            title=_candidate_label(candidate, full=True),
+            title_fontsize=LEGEND_FONTSIZE,
             frameon=True,
             handlelength=1.2,
             labelspacing=0.35,
             borderaxespad=0.4,
         )
+        legend.get_title().set_fontweight("bold")
+        _underline_legend_title(ax.figure, legend)
 
 
 def _place_bottom_legend(ax_legend, handles, ncol=None):
@@ -596,7 +637,7 @@ def _place_bottom_legend(ax_legend, handles, ncol=None):
         bbox_to_anchor=(0.5, 0.5),
         bbox_transform=ax_legend.transAxes,
         ncol=ncol,
-        fontsize=9,
+        fontsize=LEGEND_FONTSIZE,
         frameon=True,
         handlelength=1.6,
         columnspacing=1.2,
@@ -658,7 +699,7 @@ def plot_manual_timeline(
             2,
             figure=fig,
             height_ratios=[1.0, label_row],
-            width_ratios=[2.25, 0.78],
+            width_ratios=[1.75, 1.05],
             wspace=0.12,
             hspace=0.22,
         )
@@ -737,7 +778,7 @@ def plot_manual_timeline(
                 label,
                 ha="center",
                 va="center",
-                fontsize=6.5 if lane.startswith("gpu") else 7,
+                fontsize=BAR_ANNOT_FONTSIZE,
                 color=text_color,
                 fontweight="bold",
                 zorder=3,
@@ -745,9 +786,13 @@ def plot_manual_timeline(
             )
 
     ax.set_yticks([y_positions[lane] for lane in lane_order])
-    ax.set_yticklabels([LANE_LABELS[lane] for lane in lane_order], fontweight="bold")
-    ax.set_xlabel("Time (ms)", fontweight="bold", labelpad=10)
-    ax.tick_params(colors="black", pad=2)
+    ax.set_yticklabels(
+        [LANE_LABELS[lane] for lane in lane_order],
+        fontweight="bold",
+        fontsize=TICK_FONTSIZE,
+    )
+    ax.set_xlabel("Time (ms)", fontweight="bold", fontsize=LABEL_FONTSIZE, labelpad=10)
+    ax.tick_params(colors="black", pad=2, labelsize=TICK_FONTSIZE)
     for spine in ["top", "right"]:
         ax.spines[spine].set_visible(False)
 
@@ -762,7 +807,7 @@ def plot_manual_timeline(
         _place_bottom_legend(ax_legend, legend_handles)
 
     fig.subplots_adjust(
-        left=0.15 if has_breakdown else 0.13,
+        left=0.16 if has_breakdown else 0.13,
         right=0.98,
         top=0.88,
         bottom=0.20,
@@ -939,7 +984,7 @@ if __name__ == "__main__":
         "--breakdown_file",
         type=str,
         default=None,
-        help="JSON from io_profile.py --breakdown; GPU % inset on the timeline",
+        help="JSON from io_profile.py --breakdown; GPU %% inset on the timeline",
     )
     parser.add_argument(
         "--min_runtime_pct",

@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 from pathlib import Path
 import seaborn as sns
+import os
+import shutil
 
 # ==========================================
 # 1. FILE CONFIGURATION
@@ -15,9 +17,8 @@ FILE_GH200 = DATA_DIR / "single_gpu_results_gh200.csv"
 FILE_GB200 = DATA_DIR / "single_gpu_results_gb200.csv"
 FILE_MI300X = DATA_DIR / "single_gpu_results_mi300x.csv"
 
-FIT_K_MIN = 50
-THEORY_ANCHOR_K = 100
-TOP_RESERVE_FRAC = 0.28
+TOP_RESERVE_FRAC = 0.08
+EXTEND_X_FRAC = 0.20
 
 LEGEND_SHORT_NAMES = {
     "AMD MI250X": "MI250X",
@@ -36,9 +37,26 @@ try:
 except OSError:
     plt.style.use("seaborn-whitegrid")
 
+
+def _ensure_latex_on_path():
+    if shutil.which("latex"):
+        return
+    miktex_bin = Path.home() / r"AppData\Local\Programs\MiKTeX\miktex\bin\x64"
+    if (miktex_bin / "latex.exe").exists():
+        os.environ["PATH"] = str(miktex_bin) + os.pathsep + os.environ.get("PATH", "")
+
+
+_ensure_latex_on_path()
+USE_TEX = shutil.which("latex") is not None
+
+plt.rcParams["text.usetex"] = False
 plt.rcParams["font.weight"] = "bold"
 plt.rcParams["axes.labelweight"] = "bold"
 plt.rcParams["axes.titleweight"] = "bold"
+plt.rcParams["mathtext.fontset"] = "cm"
+plt.rcParams["mathtext.default"] = "it"
+if USE_TEX:
+    plt.rcParams["text.latex.preamble"] = r"\usepackage{amsmath}\usepackage{bm}"
 
 cb = sns.color_palette("colorblind")
 c_mi250 = cb[1]
@@ -81,46 +99,98 @@ def collect_finite_points(dfs, time_col):
             continue
         t = df[time_col].to_numpy(dtype=float)
         k = df["k"].to_numpy(dtype=float)
-        mask = np.isfinite(t) & (t > 0.0)
+        mask = np.isfinite(t) & np.isfinite(k) & (t > 0.0) & (k > 0.0)
         ks.extend(k[mask])
         ts.extend(t[mask])
     return np.asarray(ks, dtype=float), np.asarray(ts, dtype=float)
 
 
-def fit_loglog_exponent(k_array, time_array, k_min=FIT_K_MIN, k_max=None):
-    k = np.asarray(k_array, dtype=float)
-    t = np.asarray(time_array, dtype=float)
-    mask = np.isfinite(k) & np.isfinite(t) & (t > 0.0) & (k >= k_min)
-    if k_max is not None:
-        mask &= k <= k_max
-    if mask.sum() < 3:
-        return np.nan
-    return np.polyfit(np.log(k[mask]), np.log(t[mask]), 1)[0]
+def legend_label(name):
+    return LEGEND_SHORT_NAMES.get(name, name)
 
 
-def legend_label(name, exponent):
-    short = LEGEND_SHORT_NAMES.get(name, name)
-    if np.isfinite(exponent):
-        return rf"{short} ($k^{{{exponent:.2f}}}$)"
-    return short
+def cm_bold_k_mathtext():
+    return r"$\mathbf{(}\boldsymbol{k}\mathbf{)}$"
 
 
-def build_legend_elements(time_col, theory_power_label):
-    handles = []
-    for df, color, name in architectures:
-        exponent = np.nan
-        if not df.empty:
-            exponent = fit_loglog_exponent(df["k"], df[time_col])
-        handles.append(
-            Line2D(
-                [0],
-                [0],
-                color=color,
-                lw=2.5,
-                marker="o",
-                label=legend_label(name, exponent),
-            )
+def cm_bold_k_tex():
+    return r"$\bm{(k)}$"
+
+
+def cm_bold_big_o(power):
+    if USE_TEX:
+        return rf"$\bm{{\mathcal{{O}}(k^{power})}}$"
+    return rf"$\mathcal{{O}}(\boldsymbol{{k}}^\mathbf{{{power}}})$"
+
+
+def set_mixed_xlabel(ax, prefix="Selected Sensors"):
+    """Native-font text plus TeX math, so $(k)$ matches the legend."""
+    if not USE_TEX:
+        ax.set_xlabel(rf"{prefix} {cm_bold_k_mathtext()}", usetex=False)
+        return
+
+    ax.set_xlabel(rf"{prefix} {cm_bold_k_mathtext()}", usetex=False)
+    dummy = ax.xaxis.label
+    dummy.set_alpha(0.0)
+    text_props = {
+        "fontsize": dummy.get_size(),
+        "fontweight": "bold",
+        "color": dummy.get_color(),
+        "annotation_clip": False,
+        "ha": "left",
+        "va": "center",
+    }
+    prefix_artist = ax.annotate(
+        prefix + " ",
+        xy=(0.0, 0.5),
+        xycoords=dummy,
+        usetex=False,
+        **text_props,
+    )
+    ax.annotate(
+        cm_bold_k_tex(),
+        xy=(1.0, 0.5),
+        xycoords=prefix_artist,
+        usetex=True,
+        **text_props,
+    )
+
+
+def finite_kt(df, time_col):
+    k = df["k"].to_numpy(dtype=float)
+    t = df[time_col].to_numpy(dtype=float)
+    mask = np.isfinite(k) & np.isfinite(t) & (k > 0.0) & (t > 0.0)
+    return k[mask], t[mask]
+
+
+def last_finite_point(df, time_col):
+    k_valid, t_valid = finite_kt(df, time_col)
+    if k_valid.size == 0:
+        return None
+    idx = np.argmax(k_valid)
+    return float(k_valid[idx]), float(t_valid[idx])
+
+
+def asymptotic_extension(k_last, t_last, power, x_max, n=40):
+    if k_last <= 0.0 or t_last <= 0.0 or x_max <= k_last:
+        return np.array([]), np.array([])
+    k_ext = np.linspace(k_last, x_max, n)
+    t_ext = t_last * (k_ext / k_last) ** power
+    return k_ext, t_ext
+
+
+def build_legend_elements(theory_power_label):
+    handles = [
+        Line2D(
+            [0],
+            [0],
+            color=color,
+            lw=2.5,
+            marker="o",
+            label=legend_label(name),
         )
+        for _, color, name in architectures
+    ]
     handles.append(
         Line2D(
             [0],
@@ -135,44 +205,20 @@ def build_legend_elements(time_col, theory_power_label):
 
 
 def compute_axis_limits(
-    dfs,
+    architectures_to_plot,
     time_col,
-    x_pad_frac=0.03,
-    y_pad_frac=0.10,
+    y_pad_frac=0.06,
     top_reserve_frac=TOP_RESERVE_FRAC,
+    extend_x_frac=EXTEND_X_FRAC,
 ):
+    dfs = [df for df, _, _ in architectures_to_plot]
     ks, ts = collect_finite_points(dfs, time_col)
     if ks.size == 0:
         return 0.0, 300.0, 0.0, 1.0
 
-    x_max = ks.max() * (1.0 + x_pad_frac)
-    y_data_max = ts.max() * (1.0 + y_pad_frac)
-    y_max = y_data_max / max(1.0 - top_reserve_frac, 0.5)
+    x_max = ks.max() * (1.0 + extend_x_frac)
+    y_max = ts.max() * (1.0 + y_pad_frac) / max(1.0 - top_reserve_frac, 0.5)
     return 0.0, x_max, 0.0, y_max
-
-
-def get_shared_theoretical_curve(
-    dfs, time_col, power, x_min, x_max, anchor_k=THEORY_ANCHOR_K
-):
-    anchor_times = []
-    for df in dfs:
-        if df.empty:
-            continue
-        k = df["k"].to_numpy(dtype=float)
-        t = df[time_col].to_numpy(dtype=float)
-        mask = np.isfinite(k) & np.isfinite(t) & (t > 0.0)
-        if not mask.any():
-            continue
-        idx = np.argmin(np.abs(k[mask] - anchor_k))
-        anchor_times.append(t[mask][idx])
-
-    if not anchor_times:
-        return np.array([]), np.array([])
-
-    t_anchor = float(np.median(anchor_times))
-    c = t_anchor / (anchor_k**power)
-    k_smooth = np.linspace(x_min, x_max, 100)
-    return k_smooth, c * (k_smooth**power)
 
 
 def plot_formulation(
@@ -180,37 +226,35 @@ def plot_formulation(
     power,
     theory_power_label,
     output_file,
-    x_pad_frac=0.03,
-    y_pad_frac=0.10,
 ):
-    dfs = [df for df, _, _ in architectures if not df.empty]
-    x_min, x_max, y_min, y_max = compute_axis_limits(
-        dfs, time_col, x_pad_frac=x_pad_frac, y_pad_frac=y_pad_frac
-    )
+    plotted = [(df, color, name) for df, color, name in architectures if not df.empty]
+    x_min, x_max, y_min, y_max = compute_axis_limits(plotted, time_col)
 
     fig, ax = plt.subplots(figsize=fig_size, dpi=300)
 
-    k_smooth, t_ideal = get_shared_theoretical_curve(
-        dfs, time_col, power, x_min, x_max
-    )
-    if k_smooth.size > 0:
-        ax.plot(
-            k_smooth,
-            t_ideal,
-            color=c_theory,
-            ls="--",
-            lw=1.5,
-            alpha=0.9,
-            zorder=1,
-        )
-
-    for df, color, _name in architectures:
-        if df.empty:
+    for df, color, _name in plotted:
+        k_valid, t_valid = finite_kt(df, time_col)
+        if k_valid.size == 0:
             continue
 
+        last = last_finite_point(df, time_col)
+        if last is not None:
+            k_ext, t_ext = asymptotic_extension(last[0], last[1], power, x_max)
+            if k_ext.size > 0:
+                ax.plot(
+                    k_ext,
+                    t_ext,
+                    color=c_theory,
+                    ls="--",
+                    lw=1.5,
+                    alpha=0.9,
+                    zorder=1,
+                    clip_on=True,
+                )
+
         ax.plot(
-            df["k"],
-            df[time_col],
+            k_valid,
+            t_valid,
             color=color,
             ls="-",
             marker="o",
@@ -221,17 +265,19 @@ def plot_formulation(
             markevery=1,
         )
 
-    ax.set_xlabel(r"Selected Sensors ($k$)")
-    ax.set_ylabel("Time per Iteration (s)")
+    set_mixed_xlabel(ax)
+    ax.set_ylabel("Time per Iteration (s)", usetex=False)
     ax.set_xlim(x_min, x_max)
     ax.set_ylim(y_min, y_max)
 
-    ax.legend(
-        handles=build_legend_elements(time_col, theory_power_label),
+    legend = ax.legend(
+        handles=build_legend_elements(theory_power_label),
         loc="upper left",
         frameon=True,
         shadow=True,
     )
+    if USE_TEX:
+        legend.get_texts()[-1].set_usetex(True)
 
     plt.tight_layout()
     fig.savefig(output_file, format="pdf", bbox_inches="tight")
@@ -241,14 +287,14 @@ def plot_formulation(
 plot_formulation(
     time_col="time_N_IP",
     power=3,
-    theory_power_label=r"O($k^3$)",
+    theory_power_label=cm_bold_big_o(3),
     output_file="naive_performance.pdf",
 )
 
 plot_formulation(
     time_col="time_S_IP",
     power=2,
-    theory_power_label=r"O($k^2$)",
+    theory_power_label=cm_bold_big_o(2),
     output_file="schur_performance.pdf",
 )
 
