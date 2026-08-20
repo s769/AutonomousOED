@@ -56,6 +56,9 @@ Outputs are written under `scaling_results/` by default (both strong and weak sc
 
 ## Task 4: Cascadia application (Figure 5, real dataset required)
 
+To download the dataset, visit the [HuggingFace](https://doi.org/10.57967/hf/10077) repo and follow the instructions there.
+
+
 With the real HDF5 \(K\) matrix available on a parallel filesystem, run the greedy selection via MPI. Example:
 
 ```bash
