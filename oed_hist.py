@@ -16,6 +16,9 @@ sns.set_style("whitegrid")
 plt.rcParams["font.weight"] = "bold"
 plt.rcParams["axes.labelweight"] = "bold"
 plt.rcParams["axes.titleweight"] = "bold"
+# Embed TrueType (Type 42) instead of Type 3 bitmap fonts for publisher PDFs.
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
 
 
 # --- Helper Functions ---
@@ -370,6 +373,10 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
 
     plt.tight_layout()
     plot_path = "oed_histogram_standard.pdf"
+    if hasattr(args, "checkpoint_file") and args.checkpoint_file:
+        checkpoint_dir = os.path.dirname(os.path.abspath(args.checkpoint_file))
+        if checkpoint_dir:
+            plot_path = os.path.join(checkpoint_dir, "oed_histogram_standard.pdf")
     plt.savefig(plot_path)
     print(f"Histogram saved to {plot_path}")
 

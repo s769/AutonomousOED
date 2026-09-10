@@ -13,6 +13,9 @@ sns.set_context("paper", font_scale=1.3)
 sns.set_style("whitegrid")
 plt.rcParams["font.weight"] = "bold"
 plt.rcParams["axes.labelweight"] = "bold"
+# Embed TrueType (Type 42) instead of Type 3 bitmap fonts for publisher PDFs.
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
 
 LABEL_FONTSIZE = plt.rcParams["axes.labelsize"]
 TICK_FONTSIZE = plt.rcParams["xtick.labelsize"]

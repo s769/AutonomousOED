@@ -12,6 +12,9 @@ sns.set_style("whitegrid")
 plt.rcParams["font.weight"] = "bold"
 plt.rcParams["axes.labelweight"] = "bold"
 plt.rcParams["axes.titleweight"] = "bold"
+# Embed TrueType (Type 42) instead of Type 3 bitmap fonts for publisher PDFs.
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
 
 
 def load_data(filename, ranks_per_node, max_nodes=256, x_units="nodes"):

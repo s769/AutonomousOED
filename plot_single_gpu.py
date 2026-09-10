@@ -55,6 +55,9 @@ plt.rcParams["axes.labelweight"] = "bold"
 plt.rcParams["axes.titleweight"] = "bold"
 plt.rcParams["mathtext.fontset"] = "cm"
 plt.rcParams["mathtext.default"] = "it"
+# Embed TrueType (Type 42) instead of Type 3 bitmap fonts for publisher PDFs.
+plt.rcParams["pdf.fonttype"] = 42
+plt.rcParams["ps.fonttype"] = 42
 if USE_TEX:
     plt.rcParams["text.latex.preamble"] = r"\usepackage{amsmath}\usepackage{bm}"
 
@@ -288,14 +291,14 @@ plot_formulation(
     time_col="time_N_IP",
     power=3,
     theory_power_label=cm_bold_big_o(3),
-    output_file="naive_performance.pdf",
+    output_file=str(DATA_DIR / "naive_performance.pdf"),
 )
 
 plot_formulation(
     time_col="time_S_IP",
     power=2,
     theory_power_label=cm_bold_big_o(2),
-    output_file="schur_performance.pdf",
+    output_file=str(DATA_DIR / "schur_performance.pdf"),
 )
 
 print("Generated naive_performance.pdf and schur_performance.pdf")
