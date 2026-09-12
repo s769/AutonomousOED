@@ -12,6 +12,8 @@ This repository contains the scripts used to reproduce the performance benchmark
 - `run_scaling.sh`: Slurm wrapper to run both strong + weak scaling.
 - `select_sensors.py`: MPI greedy selection on an HDF5-backed CSZ \(K\) matrix (real dataset required).
 - `oed_hist.py`: generate random-configuration baselines and (optionally) plot the histogram.
+- `d_opt_certificate.py` / `scripts/certify_d_optimality.py`: a-posteriori optimality certificates for existing regular D-optimal designs.
+- `tests/test_certify_d_optimality.py`: small CPU synthetic certificate tests.
 
 ## Installation
 
@@ -89,6 +91,60 @@ python oed_hist.py \
   --optimal_file cascadia_optimal_results.txt \
   --budget 175
 ```
+
+## Task 6: A-posteriori D-optimality certificates
+
+Given an existing ordered regular D-optimal selection (e.g. from Task 4) and the
+same HDF5 signal covariance, certify how close the design is to the globally
+optimal \(k\)-sensor design **without** enumerating all designs.
+
+Noise convention matches `select_sensors.py`: the HDF5 file stores the signal
+covariance \(C\), and the working data covariance is the isotropic model
+
+\[
+K = r^2 C + I.
+\]
+
+Reported values use the normalized expected information gain
+\(f(S)=0.5\log\det(K_S)\) (since \(R=I\)). This is **not** the unnormalized
+`logdet` column written in greedy checkpoint files, and it is not a posterior
+trace / A-optimality metric.
+
+Cheap certificate (default checkpoints \(0\) and \(k\)):
+
+```bash
+python scripts/certify_d_optimality.py cascadia_K_matrix.h5 \
+  --selection cascadia_optimal_results.txt \
+  --r_sq 1.0 \
+  --output_prefix certificates/cascadia_k175
+```
+
+More expensive multi-checkpoint analysis (rescans remaining candidates at each
+prefix; dense schedules can approach the cost of re-running greedy):
+
+```bash
+python scripts/certify_d_optimality.py cascadia_K_matrix.h5 \
+  --selection cascadia_optimal_results.txt \
+  --r_sq 1.0 \
+  --checkpoint_stride 25 \
+  --output_prefix certificates/cascadia_stride25
+```
+
+Outputs:
+- `<prefix>_checkpoints.csv` — per-checkpoint \(f(S)\), top-\(k\) remaining
+  marginal sum, \(U(S)\), and running \(U_{\mathrm{best}}\).
+- `<prefix>_summary.json` — machine-readable summary including certified ratio
+  \(f(S_{\mathrm{final}})/U_{\mathrm{best}}\) and absolute gap bound.
+
+Small CPU synthetic tests (no production dataset required):
+
+```bash
+python -m unittest tests.test_certify_d_optimality -v
+```
+
+Scope: regular D-optimality with independent isotropic sensor-noise blocks only.
+Goal-oriented D-optimality and cross-sensor-correlated noise are rejected.
+`--r_sq` is required and must match the value used to produce the selection.
 
 ## Notes for artifact packaging
 

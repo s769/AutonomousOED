@@ -34,134 +34,53 @@ def get_block_from_h5(h5_dset, Nt, block_row_idx, block_col_idx, device, dtype):
     return torch.from_numpy(block_numpy).to(device=device, dtype=dtype)
 
 
-def fill_column_buffer(h5_dset, Nt, S_indices, candidate_idx, buffer_tensor, device, dtype):
-    """Fetches the off-diagonal blocks K_{S, c} for the Schur update."""
-    for i, s_row in enumerate(S_indices):
-        fetch_row, fetch_col = min(s_row, candidate_idx), max(s_row, candidate_idx)
-        block = get_block_from_h5(h5_dset, Nt, fetch_row, fetch_col, device, dtype)
+def build_k_submatrix(h5_dset, Nt, S_indices, device, dtype, r_sq=1.0):
+    """Build dense K_S = r_sq * A_S + I for a full sensor configuration."""
+    n = len(S_indices) * Nt
+    K_S = torch.zeros((n, n), dtype=dtype, device=device)
 
-        # Transpose if we had to fetch the upper triangle but need the lower
-        if s_row > candidate_idx:
-            block = block.T
+    for row_idx, s_row in enumerate(S_indices):
+        for col_idx in range(row_idx, len(S_indices)):
+            s_col = S_indices[col_idx]
+            fetch_row, fetch_col = min(s_row, s_col), max(s_row, s_col)
+            block = get_block_from_h5(h5_dset, Nt, fetch_row, fetch_col, device, dtype)
 
-        buffer_tensor[i * Nt : (i + 1) * Nt, :] = block
+            if fetch_row == fetch_col:
+                block = 0.5 * (block + block.T)
+            if s_row > s_col:
+                block = block.T
 
+            block.mul_(r_sq)
+            r_start, c_start = row_idx * Nt, col_idx * Nt
+            K_S[r_start : r_start + Nt, c_start : c_start + Nt] = block
+            if col_idx > row_idx:
+                K_S[c_start : c_start + Nt, r_start : r_start + Nt] = block.T
 
-def build_random_config_sequentially(
-    h5_dset, Nt, available_indices, budget, device, compute_dtype, r_sq, rng
-):
-    """
-    Builds a purely random sensor configuration incrementally.
-    Uses the Schur complement update to guarantee the matrix remains SPD.
-    If a randomly selected sensor is highly collinear with the current set, it is rejected.
-    """
-    max_size = budget * Nt
-    L_S_global = torch.zeros((max_size, max_size), device=device, dtype=compute_dtype)
-
-    S_indices = []
-    current_pool = list(available_indices)
-    current_log_det = 0.0
-
-    for k in range(budget):
-        # Shuffle the available pool so we draw candidates in a random order
-        rng.shuffle(current_pool)
-        found_valid_sensor = False
-
-        for c in current_pool:
-            # 1. Fetch the diagonal block for the candidate
-            K_cc = get_block_from_h5(h5_dset, Nt, c, c, device, compute_dtype)
-            K_cc = 0.5 * (K_cc + K_cc.T)  # Ensure strict symmetry
-            K_cc.mul_(r_sq).diagonal().add_(1.0)
-
-            if k == 0:
-                try:
-                    L_cc = torch.linalg.cholesky(K_cc)
-                    L_S_global[0:Nt, 0:Nt] = L_cc
-                    current_log_det += 2 * torch.sum(torch.log(torch.diag(L_cc))).item()
-                    found_valid_sensor = True
-                except torch.linalg.LinAlgError:
-                    pass
-            else:
-                # 2. Fetch the off-diagonal blocks K_{S, c}
-                K_Sc = torch.empty((k * Nt, Nt), dtype=compute_dtype, device=device)
-                fill_column_buffer(h5_dset, Nt, S_indices, c, K_Sc, device, compute_dtype)
-                K_Sc.mul_(r_sq)
-
-                L_S_current = L_S_global[: k * Nt, : k * Nt]
-
-                # 3. Schur Complement Update
-                # Solve: L_S * Y = K_Sc  => Y = L_S \ K_Sc
-                Y = torch.linalg.solve_triangular(L_S_current, K_Sc, upper=False)
-
-                # K_Schur = K_cc - Y^T * Y
-                K_Schur = K_cc - Y.T @ Y
-
-                max_diag = torch.max(torch.abs(K_Schur.diagonal())).item()
-                if max_diag == 0: 
-                    max_diag = 1.0
-
-                # Try Cholesky on the Schur complement with standard jitter loop
-                for jitter in [0.0]:
-                    try:
-                        if jitter > 0:
-                            K_temp = K_Schur.clone()
-                            K_temp.diagonal().add_(jitter * max_diag)
-                            L_cc = torch.linalg.cholesky(K_temp)
-                        else:
-                            L_cc = torch.linalg.cholesky(K_Schur)
-
-                        # Success! Update the global Cholesky factor
-                        L_S_global[k * Nt : (k + 1) * Nt, : k * Nt] = Y.T
-                        L_S_global[k * Nt : (k + 1) * Nt, k * Nt : (k + 1) * Nt] = L_cc
-                        
-                        # Accumulate objective
-                        current_log_det += 2 * torch.sum(torch.log(torch.diag(L_cc))).item()
-                        found_valid_sensor = True
-                        break
-                    except torch.linalg.LinAlgError:
-                        continue
-
-            if found_valid_sensor:
-                S_indices.append(c)
-                current_pool.remove(c)  # Prevent picking it again
-                break  # Break inner loop, move to next k
-
-        if not found_valid_sensor:
-            # We exhausted the entire remaining pool without finding an independent sensor
-            # This is mathematically possible if budget is extremely close to Nd
-            return None, None
-
-    return S_indices, current_log_det
+    K_S.diagonal().add_(1.0)
+    return K_S
 
 
-def pre_screen_sensors(h5_k, Nt, indices, device, dtype):
-    """Removes sensors that are inherently non-SPD due to numerical artifacts."""
-    valid_sensors = []
-    print("\nPre-screening sensors for local positive-definiteness...")
-    
-    for s in tqdm(indices, desc="Screening"):
-        block = get_block_from_h5(h5_k, Nt, s, s, device, dtype)
-        
-        block = 0.5 * (block + block.T)
-        block.diagonal().add_(1.0)
-        
-        try:
-            torch.linalg.cholesky(block)
-            valid_sensors.append(s)
-        except torch.linalg.LinAlgError:
-            pass
-            
-        del block
-        torch.cuda.empty_cache()
-        
-    removed = len(indices) - len(valid_sensors)
-    if removed > 0:
-        print(f"Removed {removed} poison-pill sensors from candidate pool.")
-    else:
-        print("All sensors passed positive-definiteness check.")
-        
-    return valid_sensors
+def evaluate_config(h5_dset, Nt, S_indices, device, dtype, r_sq):
+    """Return logdet(K_S), or -inf if the configuration is not SPD."""
+    K_S = build_k_submatrix(h5_dset, Nt, S_indices, device, dtype, r_sq)
+    try:
+        # Prefer Cholesky: matches greedy path and fails clearly on non-SPD.
+        L = torch.linalg.cholesky(K_S)
+        logdet = 2.0 * torch.sum(torch.log(torch.diag(L))).item()
+        del L, K_S
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return logdet
+    except torch.linalg.LinAlgError:
+        del K_S
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
+        return -np.inf
 
+
+def sample_random_config(available_indices, budget, rng):
+    """Draw a full random budget-sensor configuration (no sequential repair)."""
+    return rng.choice(available_indices, size=budget, replace=False).tolist()
 
 
 def _append_checkpoint_line(path, value):
@@ -256,7 +175,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
             label="Random Configurations",
             density=True,
         )
-        
+
     if optimal_value is not None:
         ax.axvline(
             optimal_value,
@@ -272,7 +191,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
             linestyle="dashed",
             linewidth=3,
             label="Uniform Configuration",
-        )   
+        )
     ax.set_xlabel("D-Optimal Objective Value")
     ax.set_ylabel("Probability Density")
     ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0), useMathText=True)
@@ -319,7 +238,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
             ax.annotate(
                 "to mean",
                 xy=(x_mid_mean, line_y_mean),
-                xytext=(0, -3),  # spacing below line (points); more negative = further down
+                xytext=(0, -3),
                 textcoords="offset points",
                 ha="center",
                 va="top",
@@ -362,7 +281,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
                 ax.annotate(
                     "to max",
                     xy=(x_mid_max, line_y_max),
-                    xytext=(0, -3),  # spacing below line (points); more negative = further down
+                    xytext=(0, -3),
                     textcoords="offset points",
                     ha="center",
                     va="top",
@@ -383,7 +302,7 @@ def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Generate Histogram using Sequential Block-Cholesky Random Sampling"
+        description="Generate Histogram via Direct Random Sensor-Config Sampling"
     )
 
     parser.add_argument("--h5_store_K", type=str, required=False, help="Path to HDF5 store for K.")
@@ -418,6 +337,7 @@ def main():
                 args.checkpoint_file, args.optimal_value, args.uniform_value, args.budget, args
             )
         return
+
     # --- HDF5 POSIX I/O Initialization ---
     try:
         h5_file_K = h5py.File(args.h5_store_K, mode="r", rdcc_nbytes=0)
@@ -439,14 +359,10 @@ def main():
 
     if rank == 0:
         print(f"Total available sensors (Nd): {Nd}")
-        available_indices = pre_screen_sensors(h5_k, Nt, available_indices, device, compute_dtype)
-    else:
-        available_indices = None
-        
-    available_indices = comm.bcast(available_indices, root=0)
+        print(f"Sampling full random configs of size {args.budget} (no sequential repair).")
+        print(f"Device={device}, precision={args.precision}, r_sq={args.r_sq}")
 
     # Determine how many workloads each MPI worker needs to process
-    local_samples_needed = 0
     checkpoint_merger = None
     if rank == 0:
         checkpoint_merger = RankCheckpointMerger(args.checkpoint_file, size)
@@ -465,39 +381,46 @@ def main():
         samples_needed = max(0, args.total_samples - existing_samples)
         print(f"Generating {samples_needed} new configurations (Budget = {args.budget})...")
 
-        # Distribute the exact number of configurations to build to each rank
         chunks = [samples_needed // size + (1 if i < samples_needed % size else 0) for i in range(size)]
     else:
         chunks = None
 
     local_samples_needed = comm.scatter(chunks, root=0)
     local_results = []
-    local_cornered_retries = 0
+    local_failed_retries = 0
 
     worker_rng = np.random.RandomState(args.seed + rank * 1000)
     rank_checkpoint = f"{args.checkpoint_file}.rank{rank}"
 
-    iterator = tqdm(range(local_samples_needed), desc=f"Rank {rank} Computing") if rank == 0 else range(local_samples_needed)
+    iterator = (
+        tqdm(range(local_samples_needed), desc=f"Rank {rank} Computing")
+        if rank == 0
+        else range(local_samples_needed)
+    )
 
     try:
         for _ in iterator:
             while True:
-                config, reg_obj = build_random_config_sequentially(
-                    h5_k, Nt, available_indices, args.budget, device, compute_dtype, args.r_sq, worker_rng
+                config = sample_random_config(available_indices, args.budget, worker_rng)
+                reg_obj = evaluate_config(
+                    h5_k, Nt, config, device, compute_dtype, args.r_sq
                 )
 
-                if config is not None and not np.isinf(reg_obj):
+                if not np.isinf(reg_obj):
                     local_results.append(reg_obj)
                     _append_checkpoint_line(rank_checkpoint, reg_obj)
                     if rank == 0:
                         checkpoint_merger.merge_new()
                     break
-                local_cornered_retries += 1
-                if rank == 0:
-                    print(f"[Retry] Rank {rank}: Cornered! Restarting configuration buildup...")
+
+                local_failed_retries += 1
+                if rank == 0 and local_failed_retries <= 5:
+                    print(
+                        f"[Retry] Rank {rank}: Cholesky failed on random config; resampling..."
+                    )
 
         all_results = comm.gather(local_results, root=0)
-        total_retries = comm.reduce(local_cornered_retries, op=MPI.SUM, root=0)
+        total_retries = comm.reduce(local_failed_retries, op=MPI.SUM, root=0)
 
         if rank == 0:
             checkpoint_merger.merge_new()
@@ -507,7 +430,7 @@ def main():
                 print("        GENERATION REPORT")
                 print("=" * 40)
                 print(f"Target Valid Samples: {len(flat_results)}")
-                print(f"Total Retries Issued: {total_retries}")
+                print(f"Total Failed Retries: {total_retries}")
                 print(f"Master Checkpoint:    {args.checkpoint_file}")
                 print("=" * 40 + "\n")
 
@@ -517,9 +440,9 @@ def main():
                 plot_histogram(
                     args.checkpoint_file, args.optimal_value, args.uniform_value, args.budget, args
                 )
-            
+
     finally:
-        if 'h5_file_K' in locals():
+        if "h5_file_K" in locals():
             h5_file_K.close()
 
 
