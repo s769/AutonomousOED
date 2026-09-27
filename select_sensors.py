@@ -1,3 +1,14 @@
+import os
+
+# Must be set before the first CUDA allocation. cuda_device repeats this for
+# the other GPU entry points; an existing user value is left alone.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and not os.environ.get(
+    "PYTORCH_ALLOC_CONF"
+):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "garbage_collection_threshold:0.5,expandable_segments:True"
+    )
+
 import h5py
 import torch
 import numpy as np
@@ -5,11 +16,60 @@ from mpi4py import MPI
 from tqdm import tqdm
 import argparse
 import math
-import os
+import sys
 
 from cuda_device import resolve_local_rank, resolve_torch_device
 from h5_batch_io import build_si_read_plan, load_ii_block, load_si_column_blocks
 from pipelined_loader import PipelinedLoader
+
+
+class LineTqdm(tqdm):
+    """One newline per refresh. ibrun drops carriage-return updates."""
+
+    def status_printer(self, file):
+        flush = getattr(file, "flush", lambda: None)
+
+        def write(s):
+            file.write(s + "\n")
+            flush()
+
+        return write
+
+
+# solve_triangular copies a non-contiguous view of L_S. That copy grows with
+# the sensor count, so keep each triangular solve at this size.
+_SOLVE_BLOCK = 8192
+
+
+def apply_lower_solve(factor, rhs, panel_storage):
+    """Solve L Y = rhs in place, one panel at a time.
+
+    ``panel_storage`` is a 1-D buffer private to the caller stream.
+    """
+    n = rhs.shape[0]
+    if n == 0:
+        return
+
+    start = 0
+    while start < n:
+        stop = min(start + _SOLVE_BLOCK, n)
+        col = 0
+        while col < start:
+            col1 = min(col + _SOLVE_BLOCK, start)
+            rhs[start:stop].addmm_(
+                factor[start:stop, col:col1],
+                rhs[col:col1],
+                beta=1.0,
+                alpha=-1.0,
+            )
+            col = col1
+
+        b = stop - start
+        panel = torch.as_strided(panel_storage, (b, b), (1, b))
+        panel.copy_(factor[start:stop, start:stop])
+        block = rhs[start:stop]
+        torch.linalg.solve_triangular(panel, block, upper=False, out=block)
+        start = stop
 
 
 def make_si_read_context(s_indices, nt, torch_h5_dtype):
@@ -150,6 +210,12 @@ def main():
 
     # Pre-allocate Cholesky out buffers
     dummy_info = [torch.empty((), dtype=torch.int32, device=device) for _ in range(2)]
+    panel_storage = [
+        torch.empty(
+            (_SOLVE_BLOCK * _SOLVE_BLOCK,), dtype=compute_dtype, device=device
+        )
+        for _ in range(2)
+    ]
 
     # Explicit CUDA streams for overlap
     streams = []
@@ -160,12 +226,26 @@ def main():
         for e, stream in zip(gpu_done_events, streams):
             e.record(stream)
 
-    if rank == 0:
-        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
-        print(f"--- Low-Memory Pipelined Selection (Rank 0 on {device}) ---")
+    cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "(unset)")
+    print(
+        f"Rank {rank}: local_rank={local_rank}, device={device}, "
+        f"CUDA_VISIBLE_DEVICES={cuda_visible}",
+        flush=True,
+    )
+    if device.type == "cuda":
+        gib = 1024**3
         print(
-            f"MPI size={size}, local_rank={local_rank}, "
-            f"CUDA_VISIBLE_DEVICES={cuda_visible}"
+            f"Rank {rank}: L_S {L_S_global.nbytes / gib:.2f} GiB, "
+            f"allocated {torch.cuda.memory_allocated(device) / gib:.2f} GiB, "
+            f"reserved {torch.cuda.memory_reserved(device) / gib:.2f} GiB",
+            flush=True,
+        )
+    if rank == 0:
+        print(f"--- Low-Memory Pipelined Selection (Rank 0 on {device}) ---")
+        print(f"MPI size={size}")
+        print(
+            "PYTORCH_CUDA_ALLOC_CONF="
+            + os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "(unset)")
         )
         if args.restart_from:
             try:
@@ -198,7 +278,15 @@ def main():
         torch.cuda.empty_cache()
 
     if rank == 0:
-        pbar = tqdm(total=args.budget, initial=len(S_indices), desc="Selecting")
+        pbar = LineTqdm(
+            total=args.budget,
+            initial=len(S_indices),
+            desc="Selecting",
+            file=sys.stdout,
+            ncols=80,
+            mininterval=0,
+            dynamic_ncols=False,
+        )
 
     try:
         for k in range(len(S_indices), args.budget):
@@ -252,6 +340,9 @@ def main():
             if actual_evals > 0:
                 loader.load_sync(0, buf_idx=0)
 
+            if k > 0 and device.type == "cuda":
+                torch.cuda.synchronize()
+
             for c, i in enumerate(valid_candidates):
                 curr_b = c % 2
                 next_b = (c + 1) % 2
@@ -288,9 +379,8 @@ def main():
 
                     if k > 0:
                         curr_Si_math.mul_(args.r_sq)
-                        # Strict In-Place Solve
-                        torch.linalg.solve_triangular(
-                            L_S, curr_Si_math, upper=False, out=curr_Si_math
+                        apply_lower_solve(
+                            L_S, curr_Si_math, panel_storage[curr_b]
                         )
 
                     K_ii_gpu_math[curr_b].mul_(args.r_sq).diagonal().add_(1.0)
@@ -420,8 +510,7 @@ def main():
                 K_Si_new.copy_(pinned_col, non_blocking=device.type == "cuda")
                 K_Si_new.mul_(args.r_sq)
 
-                # Strict In-Place Math for Synchronous Update
-                torch.linalg.solve_triangular(L_S, K_Si_new, upper=False, out=K_Si_new)
+                apply_lower_solve(L_S, K_Si_new, panel_storage[0])
                 K_ii_new.addmm_(K_Si_new.T, K_Si_new, beta=1.0, alpha=-1.0)
                 torch.linalg.cholesky(K_ii_new, out=K_ii_new)
 

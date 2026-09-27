@@ -2,6 +2,16 @@
 
 import os
 
+# Read by the caching allocator on its first CUDA allocation. A growing
+# triangular-solve copy is reused instead of leaving every old block reserved.
+# Leave an explicit user setting in place.
+if not os.environ.get("PYTORCH_CUDA_ALLOC_CONF") and not os.environ.get(
+    "PYTORCH_ALLOC_CONF"
+):
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = (
+        "garbage_collection_threshold:0.5,expandable_segments:True"
+    )
+
 import torch
 
 
@@ -64,12 +74,22 @@ def _candidate_device_ids(local_rank: int, device_count: int) -> list[int]:
 
 
 def resolve_local_rank(mpi_rank: int = 0) -> int:
-    return int(
-        os.environ.get(
-            "SLURM_LOCALID",
-            os.environ.get("OMPI_COMM_WORLD_LOCAL_RANK", mpi_rank),
-        )
-    )
+    """Return this rank's index on the node.
+
+    Prefer the variable the MPI library sets inside each process.
+    ``ibrun`` forwards the launching shell's ``SLURM_LOCALID``, so that value
+    is 0 on every rank and must not win over OpenMPI's local rank.
+    """
+    for key in (
+        "OMPI_COMM_WORLD_LOCAL_RANK",
+        "MPI_LOCALRANKID",
+        "PMI_LOCAL_RANK",
+        "SLURM_LOCALID",
+    ):
+        raw = os.environ.get(key)
+        if raw is not None and raw.strip() != "":
+            return int(raw)
+    return int(mpi_rank)
 
 
 def resolve_torch_device(
