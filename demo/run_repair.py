@@ -31,7 +31,10 @@ def main() -> None:
     )
     ap.add_argument(
         "--reference",
-        default="/global/homes/s/srvenkat/testing/certificates/oed175_rebuilt_select_single_n4.txt",
+        default=os.environ.get(
+            "OED_REFERENCE",
+            "/global/homes/s/srvenkat/testing/certificates/oed175_rebuilt_select_single_n4.txt",
+        ),
     )
     ap.add_argument(
         "--k",

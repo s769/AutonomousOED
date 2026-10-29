@@ -261,6 +261,9 @@ class RepairController(object):
         k_path = os.environ.get("OED_K", K_DEFAULT)
         if k_path and k_path != K_DEFAULT:
             cmd.extend(["--k", k_path])
+        ref_path = os.environ.get("OED_REFERENCE")
+        if ref_path:
+            cmd.extend(["--reference", ref_path])
         env = os.environ.copy()
         conda = env.get("OED_CONDA") or env.get("CONDA_PREFIX")
         if not conda or not os.path.isfile(os.path.join(conda, "bin", "python")):
