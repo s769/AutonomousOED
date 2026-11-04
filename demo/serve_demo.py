@@ -135,14 +135,27 @@ class RepairController(object):
             return
         prog = _read_progress(self.data_dir, self.scenario)
         phase = (prog or {}).get("phase")
-        if _log_has(self.log_path, "GO received") or phase == "selecting":
+        # Prefer the sidecar: TACC srun often buffers the live log, and an
+        # append-only log can still contain "GO received" from an older run.
+        if phase == "selecting":
             if self.state != "selecting":
                 self.state = "selecting"
                 if self.selection_started is None:
                     self.selection_started = _now()
                 self.message = "Selection running"
             return
-        if _log_has(self.log_path, "READY_FOR_SELECTION") or phase == "ready":
+        if phase == "ready":
+            self.state = "ready"
+            self.message = "Ready for selection"
+            return
+        if _log_has_session(self.log_path, "GO received"):
+            if self.state != "selecting":
+                self.state = "selecting"
+                if self.selection_started is None:
+                    self.selection_started = _now()
+                self.message = "Selection running"
+            return
+        if _log_has_session(self.log_path, "READY_FOR_SELECTION"):
             self.state = "ready"
             self.message = "Ready for selection"
 
@@ -198,6 +211,11 @@ class RepairController(object):
             self.log_path = os.path.join(
                 self.data_dir, "repairs", scenario + "_live.log"
             )
+            try:
+                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                open(self.log_path, "wb").close()
+            except OSError:
+                pass
             t = threading.Thread(
                 target=self._run, args=(scenario, job, launch, mode), daemon=True
             )
@@ -370,18 +388,31 @@ def _read_progress(data_dir, scenario):
     return obj
 
 
-def _log_has(path, needle):
+def _log_session_bytes(path):
+    """Return the current live-repair session only (after the last header)."""
     if not path or not os.path.isfile(path):
-        return False
+        return b""
     try:
         with open(path, "rb") as f:
             f.seek(0, os.SEEK_END)
             size = f.tell()
-            f.seek(max(0, size - 48000), os.SEEK_SET)
+            f.seek(max(0, size - 96000), os.SEEK_SET)
             raw = f.read()
     except Exception:
-        return False
-    return needle.encode("utf-8") in raw
+        return b""
+    marker = b"==== live repair "
+    idx = raw.rfind(marker)
+    if idx >= 0:
+        return raw[idx:]
+    return raw
+
+
+def _log_has(path, needle):
+    return needle.encode("utf-8") in _log_session_bytes(path)
+
+
+def _log_has_session(path, needle):
+    return _log_has(path, needle)
 
 
 def _log_tail(path, n=8):

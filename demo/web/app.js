@@ -529,8 +529,11 @@ function pollRepair() {
       const st = await fetchStatus();
       renderProgress(st);
       if (st.state === "ready") {
+        stopPoll();
         setStatus("K loaded and factorized — start selection when ready");
+        els.repairStep.textContent = "Ready — press Start selection";
         if (els.btnSelect) els.btnSelect.disabled = false;
+        if (els.btnPrepare) els.btnPrepare.disabled = false;
         return;
       }
       if (st.state === "done" && st.result) {
