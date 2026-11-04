@@ -345,14 +345,14 @@ function play() {
   state.playing = true;
   els.btnPlay.disabled = true;
   els.btnPause.disabled = false;
-  // ~3 sensors/tick keeps motion smooth; heat only swaps on the 11 keyframes.
+  // One sensor per tick; frames_meta has a UQ PNG for every k=0..175.
   state.timer = setInterval(() => {
     if (state.k >= state.order.length) {
       pause();
       return;
     }
-    setK(Math.min(state.order.length, state.k + 3));
-  }, 50);
+    setK(state.k + 1);
+  }, 40);
 }
 
 function pause() {
