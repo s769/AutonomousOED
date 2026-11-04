@@ -657,7 +657,14 @@ async function startRepair(mode) {
       throw new Error(body.error || `HTTP ${r.status}`);
     }
   } catch (e) {
-    failRepair(e.message || e);
+    const msg = String(e && e.message ? e.message : e);
+    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+      failRepair(
+        "Server unreachable (Failed to fetch). Check that serve_demo.py is still running on the compute node and the SSH tunnel points at that node."
+      );
+    } else {
+      failRepair(msg);
+    }
     return;
   }
   pollRepair();

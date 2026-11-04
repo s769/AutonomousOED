@@ -32,6 +32,21 @@ def _now():
 
 
 def find_slurm_job():
+    # Prefer the job that owns this shell (interactive compute-node sessions).
+    # Avoids a hanging/failed squeue over the tunnel path on some TACC setups.
+    jobid = os.environ.get("SLURM_JOB_ID") or os.environ.get("SLURM_JOBID")
+    if jobid:
+        nodes = int(
+            os.environ.get("SLURM_JOB_NUM_NODES")
+            or os.environ.get("SLURM_NNODES")
+            or "1"
+        )
+        return {
+            "jobid": str(jobid),
+            "state": "RUNNING",
+            "nodes": nodes,
+            "qos": os.environ.get("SLURM_JOB_QOS") or "local",
+        }, None
     try:
         out = subprocess.check_output(
             [
@@ -43,6 +58,7 @@ def find_slurm_job():
                 "%i %T %D %q",
             ],
             stderr=subprocess.STDOUT,
+            timeout=10,
         ).decode("utf-8", "replace")
     except Exception as exc:
         return None, str(exc)
@@ -180,17 +196,24 @@ class RepairController(object):
         if not os.path.isfile(k_path):
             return False, "K matrix not found at %s (set OED_K if it lives elsewhere)" % k_path
 
+        busy = ("running", "queued", "preparing", "ready", "selecting")
         with self.lock:
-            busy = ("running", "queued", "preparing", "ready", "selecting")
             if self.state in busy:
                 if self.scenario == scenario and mode == self.mode:
                     return True, "already running"
                 return False, "A repair is already running (%s)" % self.scenario
-            job, err = find_slurm_job()
-            if err:
-                return False, "squeue failed: %s" % err
-            if not job:
-                return False, "No GPU allocation. Request an interactive job, then click Repair."
+        # Resolve the allocation outside the lock so a slow squeue cannot
+        # block /api/repair/status polls (which looked like Failed to fetch).
+        job, err = find_slurm_job()
+        if err:
+            return False, "squeue failed: %s" % err
+        if not job:
+            return False, "No GPU allocation. Request an interactive job, then click Repair."
+        with self.lock:
+            if self.state in busy:
+                if self.scenario == scenario and mode == self.mode:
+                    return True, "already running"
+                return False, "A repair is already running (%s)" % self.scenario
             self.mode = mode
             if job["state"] != "RUNNING":
                 self.state = "queued"
