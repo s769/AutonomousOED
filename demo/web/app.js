@@ -18,6 +18,9 @@ const state = {
   stage: "A",
   repairing: false,
   poll: null,
+  drawnK: 0,
+  lastHeatPng: null,
+  framesReady: false,
 };
 
 const els = {
@@ -33,6 +36,7 @@ const els = {
   btnRepair: document.getElementById("btnRepair"),
   btnPrepare: document.getElementById("btnPrepare"),
   btnSelect: document.getElementById("btnSelect"),
+  btnCancel: document.getElementById("btnCancel"),
   repairHeadline: document.getElementById("repairHeadline"),
   btnOrig: document.getElementById("btnOrig"),
   btnRemainder: document.getElementById("btnRemainder"),
@@ -122,9 +126,16 @@ function showHeat(on) {
   if (els.uqHide) els.uqHide.hidden = on;
 }
 
-function setHeatUrl(url, meanStd) {
+function setHeatUrl(url, meanStd, { force } = {}) {
   if (!state.frameMeta) {
     showHeat(false);
+    return;
+  }
+  if (!force && url === state.lastHeatPng) {
+    if (meanStd != null) {
+      els.meanStd.textContent = `mean ${Number(meanStd).toFixed(2)} m`;
+    }
+    showHeat(true);
     return;
   }
   const m = state.frameMeta;
@@ -142,6 +153,7 @@ function setHeatUrl(url, meanStd) {
     heatLayer.setBounds(bounds);
     heatLayer.setUrl(url);
   }
+  state.lastHeatPng = url;
   showHeat(true);
   els.meanStd.textContent =
     meanStd != null ? `mean ${Number(meanStd).toFixed(2)} m` : "—";
@@ -263,8 +275,7 @@ function stopReveal() {
   }
 }
 
-function drawSelection({ hideNew } = {}) {
-  selLayer.clearLayers();
+function drawSelection({ hideNew, full } = {}) {
   const k = state.k;
   const sc = state.scenario;
   const repair = state.repair;
@@ -272,11 +283,20 @@ function drawSelection({ hideNew } = {}) {
 
   if (state.view === "original") {
     const n = Math.min(k, state.order.length);
-    for (let i = 0; i < n; i++) addSensor(state.order[i], "#e4572e", 5);
+    // Incremental add during play — only 11 UQ keyframes exist, but sensors
+    // advance every tick; clearing 175 markers each frame is what felt choppy.
+    if (full || n < state.drawnK) {
+      selLayer.clearLayers();
+      state.drawnK = 0;
+    }
+    for (let i = state.drawnK; i < n; i++) addSensor(state.order[i], "#e4572e", 5);
+    state.drawnK = n;
     if (sc && k >= state.order.length) markLost(lost);
     return;
   }
 
+  selLayer.clearLayers();
+  state.drawnK = 0;
   if (!repair || !sc) return;
 
   if (state.view === "remainder") {
@@ -308,26 +328,31 @@ function revealReplacements() {
   step();
 }
 
-function setK(k, { fromSlider } = {}) {
+function setK(k, { fromSlider, full } = {}) {
   state.k = k;
   els.kLabel.textContent = String(k);
   if (!fromSlider) els.kSlider.value = String(k);
   updateHeat(k);
-  drawSelection();
+  drawSelection({ full: Boolean(full || fromSlider) });
 }
 
 function play() {
   if (state.playing) return;
+  if (!state.framesReady) {
+    setStatus("Still loading UQ frames…");
+    return;
+  }
   state.playing = true;
   els.btnPlay.disabled = true;
   els.btnPause.disabled = false;
+  // ~3 sensors/tick keeps motion smooth; heat only swaps on the 11 keyframes.
   state.timer = setInterval(() => {
     if (state.k >= state.order.length) {
       pause();
       return;
     }
-    setK(state.k + 1);
-  }, 40);
+    setK(Math.min(state.order.length, state.k + 3));
+  }, 50);
 }
 
 function pause() {
@@ -384,10 +409,13 @@ function selectScenario(sc) {
   state.scenario = sc;
   state.repair = null;
   state.view = "original";
+  state.drawnK = 0;
+  state.lastHeatPng = null;
   setStage("B");
   els.btnRepair.disabled = state.repairing;
   if (els.btnPrepare) els.btnPrepare.disabled = state.repairing;
   if (els.btnSelect) els.btnSelect.disabled = true;
+  if (!state.repairing) setCancelVisible(false);
   els.compareRow.hidden = true;
   els.repairMetrics.hidden = true;
   els.origNote.hidden = true;
@@ -437,6 +465,7 @@ function showLiveRepair(repair) {
   els.btnRepair.disabled = false;
   if (els.btnPrepare) els.btnPrepare.disabled = false;
   if (els.btnSelect) els.btnSelect.disabled = true;
+  setCancelVisible(false);
   const nNew = repair.n_new != null ? repair.n_new : 0;
   const sel =
     repair.selection_seconds != null
@@ -448,9 +477,38 @@ function showLiveRepair(repair) {
     els.repairHeadline.textContent = headline;
   }
   const hw = repair.hardware || "GPU allocation";
-  fillRepairMetrics(repair, `Live on ${hw}.`);
+  const note = repair.uq_note
+    ? `Live on ${hw}. ${repair.uq_note}`
+    : `Live on ${hw}.`;
+  fillRepairMetrics(repair, note);
   applyCompare("repaired", { animate: true });
   setStatus(headline);
+}
+
+async function cancelRepair() {
+  if (!state.repairing && (!els.btnCancel || els.btnCancel.disabled)) return;
+  setCancelVisible(false);
+  els.repairStep.textContent = "Stopping…";
+  setStatus("Stopping repair…");
+  try {
+    const r = await fetch("/api/repair/cancel", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}",
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
+  } catch (e) {
+    failRepair(e.message || e);
+    return;
+  }
+  stopPoll();
+  state.repairing = false;
+  els.btnRepair.disabled = false;
+  if (els.btnPrepare) els.btnPrepare.disabled = false;
+  if (els.btnSelect) els.btnSelect.disabled = true;
+  els.repairProgress.hidden = true;
+  setStatus("Repair cancelled");
 }
 
 function stopPoll() {
@@ -491,12 +549,19 @@ async function fetchStatus() {
   return r.json();
 }
 
+function setCancelVisible(on) {
+  if (!els.btnCancel) return;
+  els.btnCancel.hidden = !on;
+  els.btnCancel.disabled = !on;
+}
+
 function beginRepairUi(statusMsg, stepMsg) {
   pause();
   state.repairing = true;
   els.btnRepair.disabled = true;
   if (els.btnPrepare) els.btnPrepare.disabled = true;
   if (els.btnSelect) els.btnSelect.disabled = true;
+  setCancelVisible(true);
   els.compareRow.hidden = true;
   els.repairMetrics.hidden = true;
   if (els.repairHeadline) els.repairHeadline.hidden = true;
@@ -517,6 +582,7 @@ function failRepair(err) {
   els.btnRepair.disabled = false;
   if (els.btnPrepare) els.btnPrepare.disabled = false;
   if (els.btnSelect) els.btnSelect.disabled = true;
+  setCancelVisible(false);
   els.repairStep.textContent = "Repair failed";
   els.repairLog.textContent = String(err);
   setStatus(`Repair failed: ${err}`);
@@ -534,11 +600,26 @@ function pollRepair() {
         els.repairStep.textContent = "Ready — press Start selection";
         if (els.btnSelect) els.btnSelect.disabled = false;
         if (els.btnPrepare) els.btnPrepare.disabled = false;
+        setCancelVisible(true);
+        return;
+      }
+      if (st.state === "idle" || st.state === "cancelled") {
+        stopPoll();
+        if (state.repairing) {
+          state.repairing = false;
+          setCancelVisible(false);
+          els.btnRepair.disabled = false;
+          if (els.btnPrepare) els.btnPrepare.disabled = false;
+          if (els.btnSelect) els.btnSelect.disabled = true;
+          els.repairProgress.hidden = true;
+          setStatus(st.message || "Repair cancelled");
+        }
         return;
       }
       if (st.state === "done" && st.result) {
         stopPoll();
         state.repairing = false;
+        setCancelVisible(false);
         showLiveRepair(st.result);
         return;
       }
@@ -626,12 +707,15 @@ function resetDemo() {
     els.btnRepair.disabled = true;
     if (els.btnPrepare) els.btnPrepare.disabled = true;
     if (els.btnSelect) els.btnSelect.disabled = true;
+    setCancelVisible(false);
   }
+  state.drawnK = 0;
+  state.lastHeatPng = null;
   [...els.scenarioButtons.querySelectorAll("button")].forEach((b) =>
     b.classList.remove("selected")
   );
   if (framed) frameMap();
-  setK(0);
+  setK(0, { full: true });
   setStatus("Ready — play the reference, then choose a branch restriction");
 }
 
@@ -651,6 +735,9 @@ if (els.btnPrepare) {
 }
 if (els.btnSelect) {
   els.btnSelect.addEventListener("click", startSelection);
+}
+if (els.btnCancel) {
+  els.btnCancel.addEventListener("click", cancelRepair);
 }
 els.btnOrig.addEventListener("click", () => applyCompare("original"));
 els.btnRemainder.addEventListener("click", () => applyCompare("remainder"));
@@ -691,10 +778,17 @@ window.addEventListener("resize", () => map.invalidateSize());
     if (els.cmax && framesMeta.vmax != null) {
       els.cmax.textContent = `${framesMeta.vmax.toFixed(2)} m`;
     }
-    for (const f of state.frames) {
-      const img = new Image();
-      img.src = `${DATA}/${f.png}`;
-    }
+    await Promise.all(
+      state.frames.map(
+        (f) =>
+          new Promise((resolve) => {
+            const img = new Image();
+            img.onload = img.onerror = () => resolve();
+            img.src = `${DATA}/${f.png}`;
+          })
+      )
+    );
+    state.framesReady = true;
 
     const scenList = await Promise.all(
       (manifest.scenarios || []).map((p) => loadJSON(p))
@@ -702,7 +796,7 @@ window.addEventListener("resize", () => map.invalidateSize());
 
     frameMap();
     drawCandidates();
-    setK(0);
+    setK(0, { full: true });
 
     for (const sc of scenList) {
       state.scenarios.push(sc);

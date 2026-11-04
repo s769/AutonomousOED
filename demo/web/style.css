@@ -137,6 +137,12 @@ button:disabled { opacity: 0.42; cursor: not-allowed; }
 button.active { background: #3a4f2f; border-color: #7cb342; }
 button.primary { background: #3a3020; border-color: var(--accent); font-weight: 650; }
 button.wide { width: 100%; padding: 0.65rem 0.75rem; font-size: 0.98rem; margin-top: 0.15rem; }
+#btnCancel {
+  margin-top: 0.35rem;
+  background: #3a2220;
+  border-color: #a05040;
+  color: #f0d0c8;
+}
 button.choice {
   display: flex;
   justify-content: space-between;

@@ -333,9 +333,14 @@ def main():
 
     S_indices = comm.bcast(S_indices, root=0)
 
+    if args.wait_for_go and rank == 0:
+        _write_demo_progress(
+            args.checkpoint_file, len(S_indices), args.budget, "preparing"
+        )
+
     if len(S_indices) > 0:
         if rank == 0:
-            print("Rebuilding Cholesky factor...")
+            print("Rebuilding Cholesky factor...", flush=True)
         K_S_rebuilt = build_k_submatrix_from_h5(
             h5_dset, Nt, S_indices, device, args.r_sq, compute_dtype
         )
@@ -355,6 +360,11 @@ def main():
                 else current_log_det
             )
             log_dets = [cur] * len(S_indices)
+            print("Cholesky rebuild finished.", flush=True)
+
+    # All ranks finish the rebuild above before rank 0 advertises ready.
+    if args.wait_for_go:
+        comm.Barrier()
 
     n_at_rebuild = len(S_indices)
     if args.wait_for_go:

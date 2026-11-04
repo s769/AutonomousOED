@@ -14,6 +14,7 @@ import functools
 import json
 import os
 import re
+import signal
 import subprocess
 import threading
 import time
@@ -148,6 +149,11 @@ class RepairController(object):
             self.state = "ready"
             self.message = "Ready for selection"
             return
+        if phase == "preparing":
+            if self.state not in ("queued", "preparing"):
+                self.state = "preparing"
+            self.message = "Loading K and factorizing…"
+            return
         if _log_has_session(self.log_path, "GO received"):
             if self.state != "selecting":
                 self.state = "selecting"
@@ -211,9 +217,23 @@ class RepairController(object):
             self.log_path = os.path.join(
                 self.data_dir, "repairs", scenario + "_live.log"
             )
+            repairs_dir = os.path.join(self.data_dir, "repairs")
+            prog_path = os.path.join(
+                repairs_dir, scenario + "_select.txt.progress.json"
+            )
             try:
-                os.makedirs(os.path.dirname(self.log_path), exist_ok=True)
+                os.makedirs(repairs_dir, exist_ok=True)
                 open(self.log_path, "wb").close()
+                # Drop any prior ready/selecting sidecar before the new job
+                # starts so the UI cannot enable Start selection early.
+                if os.path.isfile(prog_path):
+                    os.remove(prog_path)
+                if mode == "prepare":
+                    with open(prog_path, "w") as pf:
+                        json.dump(
+                            {"k": 0, "budget": self.budget, "phase": "preparing"},
+                            pf,
+                        )
             except OSError:
                 pass
             t = threading.Thread(
@@ -237,6 +257,53 @@ class RepairController(object):
             self.selection_started = _now()
             self.message = "Selection started"
             return True, self.message
+
+    def cancel(self):
+        """Stop the live repair (SIGTERM the launch process group)."""
+        with self.lock:
+            busy = ("running", "queued", "preparing", "ready", "selecting")
+            if self.state not in busy and self.proc is None:
+                return False, "No repair is running"
+            proc = self.proc
+            scenario = self.scenario
+            self.state = "cancelled"
+            self.message = "Cancelling repair…"
+            self.error = None
+        if scenario:
+            go = self._go_path(scenario)
+            try:
+                if os.path.isfile(go):
+                    os.remove(go)
+            except OSError:
+                pass
+        # Kill the launch process group (srun + select_sensors). Do not create
+        # the go file — that would start selection instead of stopping.
+        if proc is not None and proc.poll() is None:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+            except (ProcessLookupError, OSError):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            try:
+                proc.wait(timeout=8)
+            except Exception:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        with self.lock:
+            self.proc = None
+            self.state = "idle"
+            self.message = "Repair cancelled"
+            self.scenario = None
+            self.result = None
+            self.k = 0
+        return True, "Repair cancelled"
 
     def _run(self, scenario, job, launch, mode="all"):
         os.makedirs(os.path.join(self.data_dir, "repairs"), exist_ok=True)
@@ -271,14 +338,8 @@ class RepairController(object):
                 os.remove(go_file)
             except OSError:
                 pass
-        prog_file = os.path.join(
-            self.data_dir, "repairs", scenario + "_select.txt.progress.json"
-        )
-        if os.path.isfile(prog_file):
-            try:
-                os.remove(prog_file)
-            except OSError:
-                pass
+        # Progress sidecar is cleared/seeded in start(); do not delete the
+        # preparing marker here or the UI can briefly see a stale ready file.
         cmd = [
             "bash",
             launch,
@@ -340,6 +401,7 @@ class RepairController(object):
                     stderr=subprocess.STDOUT,
                     cwd=self.repo_dir,
                     env=env,
+                    start_new_session=True,
                 )
             except Exception as exc:
                 with self.lock:
@@ -353,6 +415,10 @@ class RepairController(object):
 
         out_json = os.path.join(self.data_dir, "repairs", scenario + ".json")
         with self.lock:
+            self.proc = None
+            if self.state == "cancelled" or self.state == "idle":
+                self.message = "Repair cancelled"
+                return
             if rc == 0 and os.path.isfile(out_json):
                 try:
                     self.result = json.load(open(out_json))
@@ -492,7 +558,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
-        if parsed.path not in ("/api/repair", "/api/repair/go"):
+        if parsed.path not in ("/api/repair", "/api/repair/go", "/api/repair/cancel"):
             self.send_error(404, "No such API")
             return
         if self.controller is None:
@@ -502,6 +568,13 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             body = self._read_json_body()
         except Exception:
             self._send_json({"error": "Invalid JSON body"}, 400)
+            return
+        if parsed.path == "/api/repair/cancel":
+            ok, msg = self.controller.cancel()
+            if not ok:
+                self._send_json({"error": msg}, 409)
+                return
+            self._send_json({"ok": True, "message": msg, **self.controller.snapshot()})
             return
         if parsed.path == "/api/repair/go":
             ok, msg = self.controller.go()

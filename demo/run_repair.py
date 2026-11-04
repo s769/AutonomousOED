@@ -215,6 +215,25 @@ def main() -> None:
     same = prev.get("order") == new_order
     frame_png = prev.get("frame_png") if same else None
     uq_ok = bool(same and prev.get("uq_available") and frame_png)
+    uq_mean = prev.get("uq_mean_std") if uq_ok else None
+    uq_note = None
+    # Live designs rarely byte-match the offline repair; fall back to the
+    # precomputed repaired-network UQ PNG for this exclusion (same talk asset).
+    if not uq_ok:
+        fallback = {
+            "branch_north": ("frames/north_repaired.png", 0.3898150622844696),
+            "branch_south": ("frames/south_repaired.png", 0.40201932191848755),
+        }.get(args.scenario)
+        if fallback:
+            cand, mean = fallback
+            if os.path.isfile(os.path.join(args.data, cand)):
+                frame_png = cand
+                uq_ok = True
+                uq_mean = mean
+                uq_note = (
+                    "Precomputed repaired-network displacement σ for this "
+                    "exclusion (exact live UQ needs disp_uq_oed_animate)."
+                )
 
     payload = {
         "scenario": args.scenario,
@@ -228,7 +247,8 @@ def main() -> None:
         "selection_file": out_ckpt,
         "frame_png": frame_png,
         "uq_available": uq_ok,
-        "uq_mean_std": prev.get("uq_mean_std") if uq_ok else None,
+        "uq_mean_std": uq_mean,
+        "uq_note": uq_note,
         "precomputed": False,
         "live": True,
         "wait_for_go": bool(args.wait_for_go),
