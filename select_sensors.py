@@ -38,6 +38,20 @@ class LineTqdm(tqdm):
         return write
 
 
+def _write_demo_progress(checkpoint_file, k, budget, phase):
+    """Sidecar JSON so the demo UI is not stuck behind srun stdout buffering."""
+    if not checkpoint_file:
+        return
+    path = checkpoint_file + ".progress.json"
+    tmp = path + ".tmp"
+    payload = {"k": int(k), "budget": int(budget), "phase": phase}
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
 # solve_triangular copies a non-contiguous view of L_S. That copy grows with
 # the sensor count, so keep each triangular solve at this size.
 _SOLVE_BLOCK = 8192
@@ -350,14 +364,24 @@ def main():
                 f"READY_FOR_SELECTION n={n_at_rebuild} waiting on {args.wait_for_go}",
                 flush=True,
             )
+            _write_demo_progress(
+                args.checkpoint_file, n_at_rebuild, args.budget, "ready"
+            )
             while not os.path.isfile(args.wait_for_go):
                 time.sleep(0.05)
             print("DEMO_PHASE=selecting", flush=True)
             print("GO received — starting selection", flush=True)
+            _write_demo_progress(
+                args.checkpoint_file, n_at_rebuild, args.budget, "selecting"
+            )
         comm.Barrier()
 
     t_sel0 = time.time()
     if rank == 0:
+        if not args.wait_for_go:
+            _write_demo_progress(
+                args.checkpoint_file, len(S_indices), args.budget, "selecting"
+            )
         pbar = LineTqdm(
             total=args.budget,
             initial=len(S_indices),
@@ -606,6 +630,11 @@ def main():
 
             if rank == 0:
                 pbar.update(1)
+                n_now = k + 1
+                print("PROGRESS %d/%d" % (n_now, args.budget), flush=True)
+                _write_demo_progress(
+                    args.checkpoint_file, n_now, args.budget, "selecting"
+                )
                 log_dets.append(
                     current_log_det.item()
                     if torch.is_tensor(current_log_det)

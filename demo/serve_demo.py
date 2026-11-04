@@ -100,10 +100,17 @@ class RepairController(object):
             else:
                 elapsed = 0.0
             log_tail = _log_tail(self.log_path)
-            k = _parse_k(log_tail, self.k)
+            prog = _read_progress(self.data_dir, self.scenario)
+            k = self.k
+            if prog and prog.get("k") is not None:
+                k = int(prog["k"])
+            else:
+                k = _parse_k(log_tail, self.k)
             self.k = k
             msg = self.message
-            if self.state in ("running", "queued", "preparing", "selecting") and log_tail:
+            if prog and self.state in ("running", "selecting"):
+                msg = "Selecting %s / %s" % (k, prog.get("budget") or self.budget)
+            elif self.state in ("running", "queued", "preparing", "selecting") and log_tail:
                 last = [ln for ln in log_tail.splitlines() if ln.strip()]
                 if last:
                     msg = last[-1][:160]
@@ -126,14 +133,16 @@ class RepairController(object):
             return
         if self.state in ("idle", "done", "error", "selecting"):
             return
-        if _log_has(self.log_path, "GO received"):
+        prog = _read_progress(self.data_dir, self.scenario)
+        phase = (prog or {}).get("phase")
+        if _log_has(self.log_path, "GO received") or phase == "selecting":
             if self.state != "selecting":
                 self.state = "selecting"
                 if self.selection_started is None:
                     self.selection_started = _now()
                 self.message = "Selection running"
             return
-        if _log_has(self.log_path, "READY_FOR_SELECTION"):
+        if _log_has(self.log_path, "READY_FOR_SELECTION") or phase == "ready":
             self.state = "ready"
             self.message = "Ready for selection"
 
@@ -244,6 +253,14 @@ class RepairController(object):
                 os.remove(go_file)
             except OSError:
                 pass
+        prog_file = os.path.join(
+            self.data_dir, "repairs", scenario + "_select.txt.progress.json"
+        )
+        if os.path.isfile(prog_file):
+            try:
+                os.remove(prog_file)
+            except OSError:
+                pass
         cmd = [
             "bash",
             launch,
@@ -335,6 +352,22 @@ class RepairController(object):
                 self.state = "error"
                 self.error = "Repair exited %s. See log." % rc
                 self.message = self.error
+
+
+def _read_progress(data_dir, scenario):
+    if not data_dir or not scenario:
+        return None
+    path = os.path.join(data_dir, "repairs", scenario + "_select.txt.progress.json")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path) as f:
+            obj = json.load(f)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    return obj
 
 
 def _log_has(path, needle):
