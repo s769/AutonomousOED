@@ -12,7 +12,8 @@ high-fidelity observing system when deployment constraints change.
 |------|------|
 | `demo/web/` | UI (Leaflet, bundled; no CDN) |
 | `demo/web/vendor/` | Local Leaflet 1.9.4 |
-| `demo/serve_demo.py` | Serves UI; `/data` → scratch |
+| `demo/serve_demo.py` | Serves UI; `/data` → scratch; live full + repair API |
+| `demo/run_full.py` | Unconstrained GPU select (empty → 175) |
 | `demo/run_repair.py` | GPU repair (`--exclude_file` + restart) |
 | `scripts/demo_build_web_assets.py` | Sensors, scenarios, reference UQ PNGs |
 | `scripts/demo_eval_objectives.py` | Independent slogdet of original/remainder/repair |
@@ -69,9 +70,10 @@ Last successful run: job `60119123`, **8× A100 80GB**, env `h5torch-mpi-cu13`.
 ## Presenter script (~2 minutes)
 
 1. **Physics is offline.** “We computed the wave-propagation operators once.
-   Design only reads `K`.” Play ~2 s of the sequence, then **Jump to 175**.
-   The color field is displacement uncertainty (metres), a diagnostic — the
-   design criterion is D-optimal information gain about the parameters.
+   Design only reads `K`.” Click **Compute 175** to run unconstrained greedy
+   D-opt live on the allocation (sensors appear as they are chosen). The color
+   field is displacement uncertainty (metres), a diagnostic — the design
+   criterion is D-optimal information gain about the parameters.
 2. **Ask the audience:** north or south cable corridor unavailable (survey,
    not an earthquake, not sequential inference). State the one-liner:
    “South branch unavailable: 28 selected locations must be replaced.”

@@ -5,8 +5,11 @@
     --data /pscratch/sd/s/srvenkat/oed_demo/data \\
     --port 8765
 
-POST /api/repair  launches a live GPU repair against a held Slurm allocation.
-GET  /api/repair/status  and  /api/alloc  report progress.
+POST /api/repair  launches a live GPU job against a held Slurm allocation.
+  Body: {"scenario": "full"|"branch_north"|"branch_south", "mode": "all"|"prepare"}
+  scenario=full runs unconstrained greedy selection of 175 sensors.
+GET  /api/repair/status  and  /api/alloc  report progress (status includes
+  selected order so far for live map updates).
 """
 
 import argparse
@@ -31,6 +34,45 @@ def _now():
     return time.time()
 
 
+def gpus_per_node():
+    try:
+        return max(1, int(os.environ.get("OED_SRUN_NTASKS_PER_NODE", "4")))
+    except ValueError:
+        return 4
+
+
+def total_gpus(job):
+    return max(1, int(job.get("nodes") or 1)) * gpus_per_node()
+
+
+def plan_gpus(job, requested):
+    """Map a total GPU count to (nodes, ntasks_per_node) for srun.
+
+    One task per GPU. Defaults to every GPU in the allocation. Returns
+    (nodes, ntasks_per_node, error).
+    """
+    per_node = gpus_per_node()
+    avail_nodes = max(1, int(job.get("nodes") or 1))
+    total = avail_nodes * per_node
+    if requested in (None, ""):
+        return avail_nodes, per_node, None
+    try:
+        g = int(requested)
+    except (TypeError, ValueError):
+        return None, None, "GPUs must be an integer"
+    if g < 1 or g > total:
+        return None, None, "GPUs must be between 1 and %d (allocation total)" % total
+    n = -(-g // per_node)  # fewest nodes that can hold g GPUs
+    while n <= avail_nodes and g % n:
+        n += 1
+    if n > avail_nodes:
+        return None, None, (
+            "Cannot spread %d GPUs evenly over %d node(s) x %d GPUs; "
+            "try a multiple of %d or a smaller count" % (g, avail_nodes, per_node, per_node)
+        )
+    return n, g // n, None
+
+
 def find_slurm_job():
     # Prefer the job that owns this shell (interactive compute-node sessions).
     # Avoids a hanging/failed squeue over the tunnel path on some TACC setups.
@@ -46,6 +88,8 @@ def find_slurm_job():
             "state": "RUNNING",
             "nodes": nodes,
             "qos": os.environ.get("SLURM_JOB_QOS") or "local",
+            "gpus": nodes * gpus_per_node(),
+            "gpus_per_node": gpus_per_node(),
         }, None
     try:
         out = subprocess.check_output(
@@ -73,6 +117,8 @@ def find_slurm_job():
             "state": parts[1],
             "nodes": int(parts[2]),
             "qos": parts[3],
+            "gpus": int(parts[2]) * gpus_per_node(),
+            "gpus_per_node": gpus_per_node(),
         }
         if rec["state"] == "RUNNING":
             running.append(rec)
@@ -103,6 +149,7 @@ class RepairController(object):
         self.job = None
         self.k = 0
         self.budget = 175
+        self.gpus = None
 
     def _go_path(self, scenario):
         return os.path.join(self.data_dir, "repairs", scenario + "_go")
@@ -131,6 +178,11 @@ class RepairController(object):
                 last = [ln for ln in log_tail.splitlines() if ln.strip()]
                 if last:
                     msg = last[-1][:160]
+            order = None
+            if prog and isinstance(prog.get("order"), list):
+                order = [int(x) for x in prog["order"]]
+            elif self.result and isinstance(self.result.get("order"), list):
+                order = [int(x) for x in self.result["order"]]
             return {
                 "state": self.state,
                 "mode": self.mode,
@@ -140,6 +192,7 @@ class RepairController(object):
                 "log_tail": log_tail,
                 "k": k,
                 "budget": self.budget,
+                "order": order,
                 "result": self.result,
                 "error": self.error,
                 "jobid": None if not self.job else self.job.get("jobid"),
@@ -181,40 +234,47 @@ class RepairController(object):
             self.state = "ready"
             self.message = "Ready for selection"
 
-    def start(self, scenario, mode="all"):
-        if scenario not in ("branch_north", "branch_south"):
+    def start(self, scenario, mode="all", gpus=None):
+        if scenario not in ("branch_north", "branch_south", "full"):
             return False, "Unknown scenario"
         if mode not in ("all", "prepare"):
             return False, "Unknown mode"
-        launch = os.path.join(os.path.dirname(__file__), "launch_repair.sh")
+        launch_name = "launch_full.sh" if scenario == "full" else "launch_repair.sh"
+        launch = os.path.join(os.path.dirname(__file__), launch_name)
         if not os.path.isfile(launch):
-            return False, "Live repair is not available in this package"
-        sc_path = os.path.join(self.data_dir, "scenarios", scenario + ".json")
-        if not os.path.isfile(sc_path):
-            return False, "Scenario JSON missing"
+            return False, "Live selection is not available in this package"
+        if scenario != "full":
+            sc_path = os.path.join(self.data_dir, "scenarios", scenario + ".json")
+            if not os.path.isfile(sc_path):
+                return False, "Scenario JSON missing"
         k_path = os.environ.get("OED_K", K_DEFAULT)
         if not os.path.isfile(k_path):
             return False, "K matrix not found at %s (set OED_K if it lives elsewhere)" % k_path
 
         busy = ("running", "queued", "preparing", "ready", "selecting")
+        label = "full selection" if scenario == "full" else "repair"
         with self.lock:
             if self.state in busy:
                 if self.scenario == scenario and mode == self.mode:
                     return True, "already running"
-                return False, "A repair is already running (%s)" % self.scenario
+                return False, "A job is already running (%s)" % self.scenario
         # Resolve the allocation outside the lock so a slow squeue cannot
         # block /api/repair/status polls (which looked like Failed to fetch).
         job, err = find_slurm_job()
         if err:
             return False, "squeue failed: %s" % err
         if not job:
-            return False, "No GPU allocation. Request an interactive job, then click Repair."
+            return False, "No GPU allocation. Request an interactive job, then click Compute / Repair."
+        _n, _t, gerr = plan_gpus(job, gpus)
+        if gerr:
+            return False, gerr
         with self.lock:
             if self.state in busy:
                 if self.scenario == scenario and mode == self.mode:
                     return True, "already running"
-                return False, "A repair is already running (%s)" % self.scenario
+                return False, "A job is already running (%s)" % self.scenario
             self.mode = mode
+            self.gpus = gpus
             if job["state"] != "RUNNING":
                 self.state = "queued"
             elif mode == "prepare":
@@ -226,9 +286,9 @@ class RepairController(object):
                 "Waiting for GPU job %s…" % job["jobid"]
                 if job["state"] != "RUNNING"
                 else (
-                    "Loading K and factorizing…"
+                    "Loading K…"
                     if mode == "prepare"
-                    else "Launching repair on job %s" % job["jobid"]
+                    else "Launching %s on job %s" % (label, job["jobid"])
                 )
             )
             self.error = None
@@ -282,15 +342,15 @@ class RepairController(object):
             return True, self.message
 
     def cancel(self):
-        """Stop the live repair (SIGTERM the launch process group)."""
+        """Stop the live job (SIGTERM the launch process group)."""
         with self.lock:
             busy = ("running", "queued", "preparing", "ready", "selecting")
             if self.state not in busy and self.proc is None:
-                return False, "No repair is running"
+                return False, "No selection is running"
             proc = self.proc
             scenario = self.scenario
             self.state = "cancelled"
-            self.message = "Cancelling repair…"
+            self.message = "Cancelling…"
             self.error = None
         if scenario:
             go = self._go_path(scenario)
@@ -322,11 +382,11 @@ class RepairController(object):
         with self.lock:
             self.proc = None
             self.state = "idle"
-            self.message = "Repair cancelled"
+            self.message = "Cancelled"
             self.scenario = None
             self.result = None
             self.k = 0
-        return True, "Repair cancelled"
+        return True, "Cancelled"
 
     def _run(self, scenario, job, launch, mode="all"):
         os.makedirs(os.path.join(self.data_dir, "repairs"), exist_ok=True)
@@ -350,11 +410,19 @@ class RepairController(object):
             if not current:
                 with self.lock:
                     self.state = "error"
-                    self.error = "GPU allocation disappeared before the repair started"
+                    self.error = "GPU allocation disappeared before the job started"
                     self.message = self.error
                 return
 
-        nodes = max(1, int(current.get("nodes") or 1))
+        with self.lock:
+            requested_gpus = self.gpus
+        nodes, ntpn, gerr = plan_gpus(current, requested_gpus)
+        if gerr:
+            with self.lock:
+                self.state = "error"
+                self.error = gerr
+                self.message = gerr
+            return
         go_file = self._go_path(scenario)
         if os.path.isfile(go_file):
             try:
@@ -363,18 +431,21 @@ class RepairController(object):
                 pass
         # Progress sidecar is cleared/seeded in start(); do not delete the
         # preparing marker here or the UI can briefly see a stale ready file.
+        is_full = scenario == "full"
         cmd = [
             "bash",
             launch,
-            "--scenario",
-            scenario,
             "--jobid",
             current["jobid"],
             "--nodes",
             str(nodes),
+            "--ntasks-per-node",
+            str(ntpn),
             "--data",
             self.data_dir,
         ]
+        if not is_full:
+            cmd.extend(["--scenario", scenario])
         if mode == "prepare":
             cmd.append("--wait_for_go")
         k_path = os.environ.get("OED_K", K_DEFAULT)
@@ -393,18 +464,21 @@ class RepairController(object):
         env["PYTHONNOUSERSITE"] = "1"
         env.pop("PYTHONUSERBASE", None)
 
+        label = "full selection" if is_full else "repair"
         with self.lock:
             self.job = current
             if mode == "prepare":
                 if self.state not in ("ready", "selecting"):
                     self.state = "preparing"
-                self.message = "Loading K on job %s (%s nodes)" % (
+                self.message = "Loading K on job %s (%s GPUs, %s nodes)" % (
                     current["jobid"],
+                    nodes * ntpn,
                     nodes,
                 )
             else:
                 self.state = "running"
-                self.message = "Repair running on job %s (%s nodes)" % (
+                self.message = "%s running on job %s (%s nodes)" % (
+                    label.capitalize() if is_full else "Repair",
                     current["jobid"],
                     nodes,
                 )
@@ -412,8 +486,8 @@ class RepairController(object):
         with open(self.log_path, "ab") as logf:
             logf.write(
                 (
-                    "\n==== live repair %s job %s nodes %s ====\n"
-                    % (scenario, current["jobid"], nodes)
+                    "\n==== live %s %s job %s nodes %s ====\n"
+                    % (label, scenario, current["jobid"], nodes)
                 ).encode("utf-8")
             )
             logf.flush()
@@ -429,7 +503,7 @@ class RepairController(object):
             except Exception as exc:
                 with self.lock:
                     self.state = "error"
-                    self.error = "Failed to launch repair: %s" % exc
+                    self.error = "Failed to launch %s: %s" % (label, exc)
                     self.message = self.error
                 return
             with self.lock:
@@ -440,24 +514,28 @@ class RepairController(object):
         with self.lock:
             self.proc = None
             if self.state == "cancelled" or self.state == "idle":
-                self.message = "Repair cancelled"
+                self.message = "Cancelled"
                 return
             if rc == 0 and os.path.isfile(out_json):
                 try:
                     self.result = json.load(open(out_json))
                 except Exception as exc:
                     self.state = "error"
-                    self.error = "Repair finished but JSON is unreadable: %s" % exc
+                    self.error = "%s finished but JSON is unreadable: %s" % (
+                        label.capitalize(),
+                        exc,
+                    )
                     self.message = self.error
                     return
                 self.state = "done"
                 wall = self.result.get("wall_seconds")
-                self.message = "Repair finished in %ss" % (
-                    int(wall) if wall is not None else "?"
+                self.message = "%s finished in %ss" % (
+                    "Full selection" if is_full else "Repair",
+                    int(wall) if wall is not None else "?",
                 )
             else:
                 self.state = "error"
-                self.error = "Repair exited %s. See log." % rc
+                self.error = "%s exited %s. See log." % (label.capitalize(), rc)
                 self.message = self.error
 
 
@@ -489,7 +567,7 @@ def _log_session_bytes(path):
             raw = f.read()
     except Exception:
         return b""
-    marker = b"==== live repair "
+    marker = b"==== live "
     idx = raw.rfind(marker)
     if idx >= 0:
         return raw[idx:]
@@ -608,7 +686,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
             return
         scenario = (body.get("scenario") or "").strip()
         mode = (body.get("mode") or "all").strip()
-        ok, msg = self.controller.start(scenario, mode=mode)
+        ok, msg = self.controller.start(scenario, mode=mode, gpus=body.get("gpus"))
         if not ok:
             self._send_json({"error": msg}, 409 if "already" in msg else 400)
             return

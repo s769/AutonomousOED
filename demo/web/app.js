@@ -1,10 +1,11 @@
-/* Cascadia OED SC26 demo — live repair on the held GPU allocation. */
+/* Cascadia OED SC26 demo — live full select + repair on the held GPU allocation. */
 
 const DATA = window.DEMO_DATA_URL.replace(/\/$/, "");
 
 const state = {
   sensors: [],
   order: [],
+  precomputedOrder: [],
   frames: [],
   frameMeta: null,
   presentation: null,
@@ -17,6 +18,7 @@ const state = {
   view: "original",
   stage: "A",
   repairing: false,
+  activeJob: null, // "full" | scenario id while a live job is active
   poll: null,
   drawnK: 0,
   lastHeatPng: null,
@@ -33,6 +35,16 @@ const els = {
   btnPlay: document.getElementById("btnPlay"),
   btnPause: document.getElementById("btnPause"),
   btnJump: document.getElementById("btnJump"),
+  btnFull: document.getElementById("btnFull"),
+  btnFullPrepare: document.getElementById("btnFullPrepare"),
+  btnFullSelect: document.getElementById("btnFullSelect"),
+  btnFullCancel: document.getElementById("btnFullCancel"),
+  fullHeadline: document.getElementById("fullHeadline"),
+  fullProgress: document.getElementById("fullProgress"),
+  fullStep: document.getElementById("fullStep"),
+  fullElapsed: document.getElementById("fullElapsed"),
+  fullBar: document.getElementById("fullBar"),
+  fullLog: document.getElementById("fullLog"),
   btnRepair: document.getElementById("btnRepair"),
   btnPrepare: document.getElementById("btnPrepare"),
   btnSelect: document.getElementById("btnSelect"),
@@ -66,6 +78,37 @@ const els = {
   repairBar: document.getElementById("repairBar"),
   repairLog: document.getElementById("repairLog"),
 };
+
+function isFullJob(st) {
+  return (st && st.scenario === "full") || state.activeJob === "full";
+}
+
+function progressEls(full) {
+  if (full) {
+    return {
+      progress: els.fullProgress,
+      step: els.fullStep,
+      elapsed: els.fullElapsed,
+      bar: els.fullBar,
+      log: els.fullLog,
+      selectBtn: els.btnFullSelect,
+      prepareBtn: els.btnFullPrepare,
+      cancelBtn: els.btnFullCancel,
+      primaryBtn: els.btnFull,
+    };
+  }
+  return {
+    progress: els.repairProgress,
+    step: els.repairStep,
+    elapsed: els.repairElapsed,
+    bar: els.repairBar,
+    log: els.repairLog,
+    selectBtn: els.btnSelect,
+    prepareBtn: els.btnPrepare,
+    cancelBtn: els.btnCancel,
+    primaryBtn: els.btnRepair,
+  };
+}
 
 const map = L.map("map", {
   zoomControl: true,
@@ -403,6 +446,7 @@ function applyCompare(view, { animate } = {}) {
 }
 
 function selectScenario(sc) {
+  if (state.repairing) return;
   pause();
   stopReveal();
   stopPoll();
@@ -412,16 +456,16 @@ function selectScenario(sc) {
   state.drawnK = 0;
   state.lastHeatPng = null;
   setStage("B");
-  els.btnRepair.disabled = state.repairing;
-  if (els.btnPrepare) els.btnPrepare.disabled = state.repairing;
+  els.btnRepair.disabled = false;
+  if (els.btnPrepare) els.btnPrepare.disabled = false;
   if (els.btnSelect) els.btnSelect.disabled = true;
-  if (!state.repairing) setCancelVisible(false);
+  setCancelVisible(false, false);
   els.compareRow.hidden = true;
   els.repairMetrics.hidden = true;
   els.origNote.hidden = true;
   els.precomputedNote.hidden = true;
   if (els.repairHeadline) els.repairHeadline.hidden = true;
-  if (!state.repairing) els.repairProgress.hidden = true;
+  els.repairProgress.hidden = true;
   [...els.scenarioButtons.querySelectorAll("button")].forEach((b) => {
     b.classList.toggle("selected", b.dataset.id === sc.id);
   });
@@ -456,6 +500,34 @@ function fillRepairMetrics(repair, extraNote) {
   }
 }
 
+function showLiveFull(result) {
+  const pe = progressEls(true);
+  if (pe.progress) pe.progress.hidden = true;
+  setCancelVisible(false, true);
+  state.repairing = false;
+  state.activeJob = null;
+  setFullControlsEnabled(true);
+  if (Array.isArray(result.order) && result.order.length) {
+    state.order = result.order.slice();
+    els.kMax.textContent = String(state.order.length);
+    els.kSlider.max = String(state.order.length);
+    setK(state.order.length, { full: true });
+  }
+  const sel =
+    result.selection_seconds != null
+      ? result.selection_seconds
+      : result.wall_seconds;
+  const n = result.n_selected != null ? result.n_selected : state.order.length;
+  const headline = `Live design: ${n} sensors selected in ${fmtElapsed(sel)}`;
+  if (els.fullHeadline) {
+    els.fullHeadline.hidden = false;
+    els.fullHeadline.textContent = headline;
+  }
+  const hw = result.hardware || "GPU allocation";
+  setStatus(`${headline} · ${hw}`);
+  setStage("A");
+}
+
 function showLiveRepair(repair) {
   state.repair = repair;
   setStage("C");
@@ -465,7 +537,9 @@ function showLiveRepair(repair) {
   els.btnRepair.disabled = false;
   if (els.btnPrepare) els.btnPrepare.disabled = false;
   if (els.btnSelect) els.btnSelect.disabled = true;
-  setCancelVisible(false);
+  setCancelVisible(false, false);
+  setFullControlsEnabled(true);
+  state.activeJob = null;
   const nNew = repair.n_new != null ? repair.n_new : 0;
   const sel =
     repair.selection_seconds != null
@@ -485,11 +559,44 @@ function showLiveRepair(repair) {
   setStatus(headline);
 }
 
-async function cancelRepair() {
-  if (!state.repairing && (!els.btnCancel || els.btnCancel.disabled)) return;
-  setCancelVisible(false);
-  els.repairStep.textContent = "Stopping…";
-  setStatus("Stopping repair…");
+function setFullControlsEnabled(on) {
+  if (els.btnFull) els.btnFull.disabled = !on;
+  if (els.btnFullPrepare) els.btnFullPrepare.disabled = !on;
+  if (els.btnFullSelect) els.btnFullSelect.disabled = true;
+  if (els.btnPlay) els.btnPlay.disabled = !on;
+}
+
+function restorePrecomputedOrder() {
+  if (!state.precomputedOrder.length) return;
+  state.order = state.precomputedOrder.slice();
+  els.kMax.textContent = String(state.order.length);
+  els.kSlider.max = String(state.order.length);
+  state.drawnK = 0;
+  state.lastHeatPng = null;
+  setK(0, { full: true });
+}
+
+function setCancelVisible(on, full) {
+  const useFull = full == null ? isFullJob({ scenario: state.activeJob }) : full;
+  const pe = progressEls(useFull);
+  if (!pe.cancelBtn) return;
+  pe.cancelBtn.hidden = !on;
+  pe.cancelBtn.disabled = !on;
+  // Hide the other job's cancel if present.
+  const other = progressEls(!useFull);
+  if (other.cancelBtn && other.cancelBtn !== pe.cancelBtn) {
+    other.cancelBtn.hidden = true;
+    other.cancelBtn.disabled = true;
+  }
+}
+
+async function cancelJob() {
+  if (!state.repairing) return;
+  const full = state.activeJob === "full";
+  const pe = progressEls(full);
+  setCancelVisible(false, full);
+  if (pe.step) pe.step.textContent = "Stopping…";
+  setStatus("Stopping…");
   try {
     const r = await fetch("/api/repair/cancel", {
       method: "POST",
@@ -499,16 +606,21 @@ async function cancelRepair() {
     const body = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(body.error || `HTTP ${r.status}`);
   } catch (e) {
-    failRepair(e.message || e);
+    failJob(e.message || e, full);
     return;
   }
   stopPoll();
   state.repairing = false;
-  els.btnRepair.disabled = false;
-  if (els.btnPrepare) els.btnPrepare.disabled = false;
-  if (els.btnSelect) els.btnSelect.disabled = true;
-  els.repairProgress.hidden = true;
-  setStatus("Repair cancelled");
+  state.activeJob = null;
+  if (pe.primaryBtn) pe.primaryBtn.disabled = false;
+  if (pe.prepareBtn) pe.prepareBtn.disabled = false;
+  if (pe.selectBtn) pe.selectBtn.disabled = true;
+  if (pe.progress) pe.progress.hidden = true;
+  setFullControlsEnabled(true);
+  els.btnRepair.disabled = !state.scenario;
+  if (els.btnPrepare) els.btnPrepare.disabled = !state.scenario;
+  if (full) restorePrecomputedOrder();
+  setStatus("Cancelled");
 }
 
 function stopPoll() {
@@ -519,27 +631,39 @@ function stopPoll() {
 }
 
 function renderProgress(st) {
-  els.repairProgress.hidden = false;
+  const full = isFullJob(st);
+  const pe = progressEls(full);
+  if (!pe.progress) return;
+  pe.progress.hidden = false;
   const k = st.k != null ? st.k : 0;
   const budget = st.budget || 175;
   let step = "Running on GPUs…";
   if (st.state === "queued") step = st.message || "Waiting for GPUs…";
-  else if (st.state === "preparing") step = "Loading K and factorizing…";
+  else if (st.state === "preparing")
+    step = full ? "Loading K…" : "Loading K and factorizing…";
   else if (st.state === "ready") step = "Ready — press Start selection";
   else if (st.state === "selecting" || k) step = `Selecting ${k} / ${budget}`;
   else if (st.message && !/^srun |^====/.test(st.message)) step = st.message;
-  els.repairStep.textContent = step;
-  els.repairElapsed.textContent = fmtElapsed(st.elapsed_s);
-  els.repairBar.style.width = `${Math.min(100, (100 * k) / budget)}%`;
-  if (els.btnSelect) {
-    els.btnSelect.disabled = st.state !== "ready";
-  }
-  if (st.log_tail) {
+  pe.step.textContent = step;
+  pe.elapsed.textContent = fmtElapsed(st.elapsed_s);
+  pe.bar.style.width = `${Math.min(100, (100 * k) / budget)}%`;
+  if (pe.selectBtn) pe.selectBtn.disabled = st.state !== "ready";
+  if (st.log_tail && pe.log) {
     const clean = st.log_tail
       .split("\n")
       .map((ln) => ln.replace(/[█▉▊▋▌▍▎▏\u2588-\u2593]+/g, "").trim())
       .filter((ln) => ln && !ln.startsWith("srun") && !ln.startsWith("===="));
-    els.repairLog.textContent = clean.slice(-6).join("\n");
+    pe.log.textContent = clean.slice(-6).join("\n");
+  }
+  // Stream selected sensors onto the map during full live select.
+  if (full && Array.isArray(st.order) && st.order.length) {
+    state.order = st.order.slice();
+    const nk = st.order.length;
+    if (nk !== state.k) setK(nk);
+    else {
+      updateHeat(nk);
+      drawSelection({});
+    }
   }
 }
 
@@ -549,108 +673,147 @@ async function fetchStatus() {
   return r.json();
 }
 
-function setCancelVisible(on) {
-  if (!els.btnCancel) return;
-  els.btnCancel.hidden = !on;
-  els.btnCancel.disabled = !on;
-}
-
-function beginRepairUi(statusMsg, stepMsg) {
+function beginJobUi(opts) {
+  const { full, statusMsg, stepMsg } = opts;
   pause();
   state.repairing = true;
-  els.btnRepair.disabled = true;
-  if (els.btnPrepare) els.btnPrepare.disabled = true;
-  if (els.btnSelect) els.btnSelect.disabled = true;
-  setCancelVisible(true);
-  els.compareRow.hidden = true;
-  els.repairMetrics.hidden = true;
-  if (els.repairHeadline) els.repairHeadline.hidden = true;
-  els.repairProgress.hidden = false;
-  els.repairLog.textContent = "";
-  els.repairBar.style.width = "0%";
-  els.repairStep.textContent = stepMsg;
-  els.repairElapsed.textContent = "0s";
-  setStage("C");
+  state.activeJob = full ? "full" : state.scenario && state.scenario.id;
+  const pe = progressEls(full);
+  if (pe.primaryBtn) pe.primaryBtn.disabled = true;
+  if (pe.prepareBtn) pe.prepareBtn.disabled = true;
+  if (pe.selectBtn) pe.selectBtn.disabled = true;
+  setCancelVisible(true, full);
+  if (full) {
+    setFullControlsEnabled(false);
+    if (els.btnFull) els.btnFull.disabled = true;
+    if (els.btnFullPrepare) els.btnFullPrepare.disabled = true;
+    if (els.btnPlay) els.btnPlay.disabled = true;
+    if (els.fullHeadline) els.fullHeadline.hidden = true;
+    els.btnRepair.disabled = true;
+    if (els.btnPrepare) els.btnPrepare.disabled = true;
+    if (els.btnSelect) els.btnSelect.disabled = true;
+    // Clear prior design so sensors appear live as they are chosen.
+    state.order = [];
+    state.drawnK = 0;
+    state.lastHeatPng = null;
+    setK(0, { full: true });
+    setStage("A");
+  } else {
+    if (els.btnFull) els.btnFull.disabled = true;
+    if (els.btnFullPrepare) els.btnFullPrepare.disabled = true;
+    if (els.btnFullSelect) els.btnFullSelect.disabled = true;
+    els.compareRow.hidden = true;
+    els.repairMetrics.hidden = true;
+    if (els.repairHeadline) els.repairHeadline.hidden = true;
+    setStage("C");
+  }
+  if (pe.progress) pe.progress.hidden = false;
+  if (pe.log) pe.log.textContent = "";
+  if (pe.bar) pe.bar.style.width = "0%";
+  if (pe.step) pe.step.textContent = stepMsg;
+  if (pe.elapsed) pe.elapsed.textContent = "0s";
   setStatus(statusMsg);
   try {
-    els.btnRepair.scrollIntoView({ block: "center", behavior: "smooth" });
+    if (pe.primaryBtn)
+      pe.primaryBtn.scrollIntoView({ block: "center", behavior: "smooth" });
   } catch (e) {}
 }
 
-function failRepair(err) {
+function failJob(err, full) {
+  const useFull = full == null ? state.activeJob === "full" : full;
+  const pe = progressEls(useFull);
   state.repairing = false;
-  els.btnRepair.disabled = false;
-  if (els.btnPrepare) els.btnPrepare.disabled = false;
-  if (els.btnSelect) els.btnSelect.disabled = true;
-  setCancelVisible(false);
-  els.repairStep.textContent = "Repair failed";
-  els.repairLog.textContent = String(err);
-  setStatus(`Repair failed: ${err}`);
+  state.activeJob = null;
+  if (pe.primaryBtn) pe.primaryBtn.disabled = false;
+  if (pe.prepareBtn) pe.prepareBtn.disabled = false;
+  if (pe.selectBtn) pe.selectBtn.disabled = true;
+  setCancelVisible(false, useFull);
+  setFullControlsEnabled(true);
+  els.btnRepair.disabled = !state.scenario;
+  if (els.btnPrepare) els.btnPrepare.disabled = !state.scenario;
+  if (useFull) restorePrecomputedOrder();
+  if (pe.step) pe.step.textContent = useFull ? "Selection failed" : "Repair failed";
+  if (pe.log) pe.log.textContent = String(err);
+  setStatus(`${useFull ? "Selection" : "Repair"} failed: ${err}`);
 }
 
-function pollRepair() {
+function pollJob() {
   stopPoll();
   const tick = async () => {
     try {
       const st = await fetchStatus();
+      const full = isFullJob(st);
       renderProgress(st);
       if (st.state === "ready") {
         stopPoll();
-        setStatus("K loaded and factorized — start selection when ready");
-        els.repairStep.textContent = "Ready — press Start selection";
-        if (els.btnSelect) els.btnSelect.disabled = false;
-        if (els.btnPrepare) els.btnPrepare.disabled = false;
-        setCancelVisible(true);
+        setStatus(
+          full
+            ? "K loaded — start selection when ready"
+            : "K loaded and factorized — start selection when ready"
+        );
+        const pe = progressEls(full);
+        if (pe.step) pe.step.textContent = "Ready — press Start selection";
+        if (pe.selectBtn) pe.selectBtn.disabled = false;
+        if (pe.prepareBtn) pe.prepareBtn.disabled = false;
+        setCancelVisible(true, full);
         return;
       }
       if (st.state === "idle" || st.state === "cancelled") {
         stopPoll();
         if (state.repairing) {
+          const pe = progressEls(full);
           state.repairing = false;
-          setCancelVisible(false);
-          els.btnRepair.disabled = false;
-          if (els.btnPrepare) els.btnPrepare.disabled = false;
-          if (els.btnSelect) els.btnSelect.disabled = true;
-          els.repairProgress.hidden = true;
-          setStatus(st.message || "Repair cancelled");
+          state.activeJob = null;
+          setCancelVisible(false, full);
+          if (pe.primaryBtn) pe.primaryBtn.disabled = false;
+          if (pe.prepareBtn) pe.prepareBtn.disabled = false;
+          if (pe.selectBtn) pe.selectBtn.disabled = true;
+          if (pe.progress) pe.progress.hidden = true;
+          setFullControlsEnabled(true);
+          els.btnRepair.disabled = !state.scenario;
+          if (els.btnPrepare) els.btnPrepare.disabled = !state.scenario;
+          if (full) restorePrecomputedOrder();
+          setStatus(st.message || "Cancelled");
         }
         return;
       }
       if (st.state === "done" && st.result) {
         stopPoll();
         state.repairing = false;
-        setCancelVisible(false);
-        showLiveRepair(st.result);
+        setCancelVisible(false, full);
+        if (full) showLiveFull(st.result);
+        else showLiveRepair(st.result);
         return;
       }
       if (st.state === "error") {
         stopPoll();
-        failRepair(st.error || "Repair failed");
+        failJob(st.error || "Job failed", full);
       }
     } catch (e) {
       stopPoll();
-      failRepair(e.message || e);
+      failJob(e.message || e);
     }
   };
   state.poll = setInterval(tick, 800);
   tick();
 }
 
-async function startRepair(mode) {
-  if (!state.scenario || state.repairing) return;
+async function startFull(mode) {
+  if (state.repairing) return;
   const prepare = mode === "prepare";
-  beginRepairUi(
-    prepare
-      ? "Loading K and factorizing retained sensors…"
-      : "Repair running on the GPU allocation…",
-    prepare ? "Loading K…" : "Submitting to GPUs…"
-  );
+  beginJobUi({
+    full: true,
+    statusMsg: prepare
+      ? "Loading K on the GPU allocation…"
+      : "Full 175-sensor selection running on the GPU allocation…",
+    stepMsg: prepare ? "Loading K…" : "Submitting to GPUs…",
+  });
 
   try {
     const r = await fetch("/api/repair", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scenario: state.scenario.id, mode: mode || "all" }),
+      body: JSON.stringify({ scenario: "full", mode: mode || "all", gpus: gpuCount() }),
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) {
@@ -659,46 +822,99 @@ async function startRepair(mode) {
   } catch (e) {
     const msg = String(e && e.message ? e.message : e);
     if (/failed to fetch|networkerror|load failed/i.test(msg)) {
-      failRepair(
-        "Server unreachable (Failed to fetch). Check that serve_demo.py is still running on the compute node and the SSH tunnel points at that node."
+      failJob(
+        "Server unreachable (Failed to fetch). Check that serve_demo.py is still running on the compute node and the SSH tunnel points at that node.",
+        true
       );
     } else {
-      failRepair(msg);
+      failJob(msg, true);
     }
     return;
   }
-  pollRepair();
+  pollJob();
 }
 
-async function startSelection() {
-  if (!state.scenario) return;
-  if (els.btnSelect) els.btnSelect.disabled = true;
-  setStatus("Selection running…");
-  els.repairStep.textContent = "Starting selection…";
+function gpuCount() {
+  const el = document.getElementById("gpuCount");
+  const v = el ? parseInt(el.value, 10) : NaN;
+  return Number.isFinite(v) && v > 0 ? v : null; // null = whole allocation
+}
+
+async function startRepair(mode) {
+  if (!state.scenario || state.repairing) return;
+  const prepare = mode === "prepare";
+  beginJobUi({
+    full: false,
+    statusMsg: prepare
+      ? "Loading K and factorizing retained sensors…"
+      : "Repair running on the GPU allocation…",
+    stepMsg: prepare ? "Loading K…" : "Submitting to GPUs…",
+  });
+
   try {
-    const r = await fetch("/api/repair/go", {
+    const r = await fetch("/api/repair", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ scenario: state.scenario.id }),
+      body: JSON.stringify({ scenario: state.scenario.id, mode: mode || "all", gpus: gpuCount() }),
     });
     const body = await r.json().catch(() => ({}));
     if (!r.ok) {
       throw new Error(body.error || `HTTP ${r.status}`);
     }
   } catch (e) {
-    failRepair(e.message || e);
+    const msg = String(e && e.message ? e.message : e);
+    if (/failed to fetch|networkerror|load failed/i.test(msg)) {
+      failJob(
+        "Server unreachable (Failed to fetch). Check that serve_demo.py is still running on the compute node and the SSH tunnel points at that node.",
+        false
+      );
+    } else {
+      failJob(msg, false);
+    }
     return;
   }
-  pollRepair();
+  pollJob();
+}
+
+async function startSelection() {
+  if (!state.activeJob && !state.scenario) return;
+  const full = state.activeJob === "full";
+  const pe = progressEls(full);
+  if (pe.selectBtn) pe.selectBtn.disabled = true;
+  setStatus("Selection running…");
+  if (pe.step) pe.step.textContent = "Starting selection…";
+  try {
+    const r = await fetch("/api/repair/go", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        scenario: full ? "full" : state.scenario.id,
+      }),
+    });
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) {
+      throw new Error(body.error || `HTTP ${r.status}`);
+    }
+  } catch (e) {
+    failJob(e.message || e, full);
+    return;
+  }
+  pollJob();
 }
 
 function resetDemo() {
+  if (state.repairing) return;
   pause();
   stopReveal();
   stopPoll();
   state.scenario = null;
   state.repair = null;
+  state.activeJob = null;
   state.view = "original";
+  // Restore precomputed reference order for playback until the next live run.
+  if (state.precomputedOrder.length) {
+    state.order = state.precomputedOrder.slice();
+  }
   setStage("A");
   polyLayer.clearLayers();
   exclLayer.clearLayers();
@@ -709,13 +925,15 @@ function resetDemo() {
   els.origNote.hidden = true;
   els.precomputedNote.hidden = true;
   if (els.repairHeadline) els.repairHeadline.hidden = true;
-  if (!state.repairing) {
-    els.repairProgress.hidden = true;
-    els.btnRepair.disabled = true;
-    if (els.btnPrepare) els.btnPrepare.disabled = true;
-    if (els.btnSelect) els.btnSelect.disabled = true;
-    setCancelVisible(false);
-  }
+  if (els.fullHeadline) els.fullHeadline.hidden = true;
+  els.repairProgress.hidden = true;
+  if (els.fullProgress) els.fullProgress.hidden = true;
+  els.btnRepair.disabled = true;
+  if (els.btnPrepare) els.btnPrepare.disabled = true;
+  if (els.btnSelect) els.btnSelect.disabled = true;
+  setCancelVisible(false, false);
+  setCancelVisible(false, true);
+  setFullControlsEnabled(true);
   state.drawnK = 0;
   state.lastHeatPng = null;
   [...els.scenarioButtons.querySelectorAll("button")].forEach((b) =>
@@ -723,7 +941,7 @@ function resetDemo() {
   );
   if (framed) frameMap();
   setK(0, { full: true });
-  setStatus("Ready — play the reference, then choose a branch restriction");
+  setStatus("Ready — compute the reference live, then choose a branch restriction");
 }
 
 els.btnPlay.addEventListener("click", play);
@@ -736,6 +954,18 @@ els.kSlider.addEventListener("input", () => {
   pause();
   setK(Number(els.kSlider.value), { fromSlider: true });
 });
+if (els.btnFull) {
+  els.btnFull.addEventListener("click", () => startFull("all"));
+}
+if (els.btnFullPrepare) {
+  els.btnFullPrepare.addEventListener("click", () => startFull("prepare"));
+}
+if (els.btnFullSelect) {
+  els.btnFullSelect.addEventListener("click", startSelection);
+}
+if (els.btnFullCancel) {
+  els.btnFullCancel.addEventListener("click", cancelJob);
+}
 els.btnRepair.addEventListener("click", () => startRepair("all"));
 if (els.btnPrepare) {
   els.btnPrepare.addEventListener("click", () => startRepair("prepare"));
@@ -744,7 +974,7 @@ if (els.btnSelect) {
   els.btnSelect.addEventListener("click", startSelection);
 }
 if (els.btnCancel) {
-  els.btnCancel.addEventListener("click", cancelRepair);
+  els.btnCancel.addEventListener("click", cancelJob);
 }
 els.btnOrig.addEventListener("click", () => applyCompare("original"));
 els.btnRemainder.addEventListener("click", () => applyCompare("remainder"));
@@ -774,7 +1004,8 @@ window.addEventListener("resize", () => map.invalidateSize());
       loadJSON(manifest.frames_meta),
     ]);
     state.sensors = sensors.sensors;
-    state.order = reference.order;
+    state.precomputedOrder = reference.order.slice();
+    state.order = reference.order.slice();
     state.frameMeta = framesMeta;
     state.frames = framesMeta.frames;
     els.kMax.textContent = String(state.order.length);
@@ -823,14 +1054,27 @@ window.addEventListener("resize", () => map.invalidateSize());
         r.ok ? r.json() : null
       );
       if (alloc && alloc.jobid) {
+        const gi = document.getElementById("gpuCount");
+        if (gi && alloc.gpus) {
+          gi.max = alloc.gpus;
+          gi.value = alloc.gpus;
+          const gm = document.getElementById("gpuMax");
+          if (gm) gm.textContent = `of ${alloc.gpus} in allocation`;
+        }
         setStatus(
-          `Ready · GPU job ${alloc.jobid} (${alloc.nodes} node${alloc.nodes === 1 ? "" : "s"})`
+          `Ready · GPU job ${alloc.jobid} (${alloc.nodes} node${
+            alloc.nodes === 1 ? "" : "s"
+          }) — Compute 175 live`
         );
       } else {
-        setStatus("Ready — play the reference, then choose a branch restriction");
+        setStatus(
+          "Ready — hold a GPU allocation, then Compute 175 (or Playback)"
+        );
       }
     } catch (e) {
-      setStatus("Ready — play the reference, then choose a branch restriction");
+      setStatus(
+        "Ready — hold a GPU allocation, then Compute 175 (or Playback)"
+      );
     }
   } catch (e) {
     setStatus(`Failed to load demo data: ${e.message}`);

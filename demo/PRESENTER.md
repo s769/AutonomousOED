@@ -4,10 +4,13 @@
 observing system when deployment constraints change.
 
 1. **Physics is already done.** “We computed the wave-propagation operators
-   once and stored them as `K`. Design only reads that matrix.” Play one or two
-   seconds of the greedy sequence, then **Jump to 175**. The color field is
+   once and stored them as `K`. Design only reads that matrix.” Click
+   **Compute 175** to run unconstrained greedy D-opt live on the held
+   allocation (or **Load K** then **Start selection** for a timed reveal).
+   Sensors appear on the map as they are chosen. The color field is
    posterior σ of seafloor displacement (metres) — a diagnostic. The design
    criterion is D-optimal information gain about the inferred parameters.
+   **Playback** still animates a precomputed reference if you need a dry run.
 2. **Ask the audience.** North or south cable corridor unavailable (a survey
    constraint, not an earthquake, not sequential inference from data already
    collected). Read the one-liner:

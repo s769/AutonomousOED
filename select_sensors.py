@@ -38,13 +38,15 @@ class LineTqdm(tqdm):
         return write
 
 
-def _write_demo_progress(checkpoint_file, k, budget, phase):
+def _write_demo_progress(checkpoint_file, k, budget, phase, order=None):
     """Sidecar JSON so the demo UI is not stuck behind srun stdout buffering."""
     if not checkpoint_file:
         return
     path = checkpoint_file + ".progress.json"
     tmp = path + ".tmp"
     payload = {"k": int(k), "budget": int(budget), "phase": phase}
+    if order is not None:
+        payload["order"] = [int(x) for x in order]
     with open(tmp, "w") as f:
         json.dump(payload, f)
         f.flush()
@@ -335,7 +337,11 @@ def main():
 
     if args.wait_for_go and rank == 0:
         _write_demo_progress(
-            args.checkpoint_file, len(S_indices), args.budget, "preparing"
+            args.checkpoint_file,
+            len(S_indices),
+            args.budget,
+            "preparing",
+            order=S_indices,
         )
 
     if len(S_indices) > 0:
@@ -375,14 +381,22 @@ def main():
                 flush=True,
             )
             _write_demo_progress(
-                args.checkpoint_file, n_at_rebuild, args.budget, "ready"
+                args.checkpoint_file,
+                n_at_rebuild,
+                args.budget,
+                "ready",
+                order=S_indices,
             )
             while not os.path.isfile(args.wait_for_go):
                 time.sleep(0.05)
             print("DEMO_PHASE=selecting", flush=True)
             print("GO received — starting selection", flush=True)
             _write_demo_progress(
-                args.checkpoint_file, n_at_rebuild, args.budget, "selecting"
+                args.checkpoint_file,
+                n_at_rebuild,
+                args.budget,
+                "selecting",
+                order=S_indices,
             )
         comm.Barrier()
 
@@ -390,7 +404,11 @@ def main():
     if rank == 0:
         if not args.wait_for_go:
             _write_demo_progress(
-                args.checkpoint_file, len(S_indices), args.budget, "selecting"
+                args.checkpoint_file,
+                len(S_indices),
+                args.budget,
+                "selecting",
+                order=S_indices,
             )
         pbar = LineTqdm(
             total=args.budget,
@@ -643,7 +661,11 @@ def main():
                 n_now = k + 1
                 print("PROGRESS %d/%d" % (n_now, args.budget), flush=True)
                 _write_demo_progress(
-                    args.checkpoint_file, n_now, args.budget, "selecting"
+                    args.checkpoint_file,
+                    n_now,
+                    args.budget,
+                    "selecting",
+                    order=S_indices,
                 )
                 log_dets.append(
                     current_log_det.item()
