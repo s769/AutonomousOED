@@ -201,6 +201,22 @@ python oed_hist.py \
 
 `--optimal_value` and `--uniform_value` can be used instead of the two files to pass the numbers directly.
 
+## Citation
+
+If you use this software, please cite the paper (GitHub's "Cite this repository" button reads `CITATION.cff`):
+
+```bibtex
+@inproceedings{venkat2026sensor,
+  author    = {Venkat, Sreeram and Henneking, Stefan and Ghattas, Omar},
+  title     = {Sensor placement for tsunami early warning via large-scale {Bayesian} optimal experimental design},
+  booktitle = {Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis},
+  series    = {SC '26},
+  year      = {2026},
+  pages     = {234--253},
+  doi       = {10.1109/SC51908.2026.00022}
+}
+```
+
 ## Notes for artifact packaging
 
 - Large datasets (e.g., the CSZ \(K\) matrix) are intentionally **not** included in this repository.
