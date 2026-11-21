@@ -143,8 +143,8 @@ with Git LFS, so **`git lfs pull` is required**: a plain `git clone` only fetche
 
 ```bash
 git lfs install                      # once per machine; on some systems: module load git-lfs
-git clone <repository URL shown on the dataset page>
-cd <repository directory>
+git clone https://huggingface.co/datasets/s769/cascadia_K_matrix
+cd cascadia_K_matrix
 git lfs pull                         # downloads the matrix parts; this can take a couple of hours
 cat cascadia_K_matrix.h5.part* > cascadia_K_matrix.h5
 ```
