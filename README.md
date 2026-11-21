@@ -257,6 +257,22 @@ Scope: regular D-optimality with independent isotropic sensor-noise blocks only.
 Goal-oriented D-optimality and cross-sensor-correlated noise are rejected.
 `--r_sq` is required and must match the value used to produce the selection.
 
+## Citation
+
+If you use this software, please cite the paper (GitHub's "Cite this repository" button reads `CITATION.cff`):
+
+```bibtex
+@inproceedings{venkat2026sensor,
+  author    = {Venkat, Sreeram and Henneking, Stefan and Ghattas, Omar},
+  title     = {Sensor placement for tsunami early warning via large-scale {Bayesian} optimal experimental design},
+  booktitle = {Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis},
+  series    = {SC '26},
+  year      = {2026},
+  pages     = {234--253},
+  doi       = {10.1109/SC51908.2026.00022}
+}
+```
+
 ## Notes for artifact packaging
 
 - Large datasets (e.g., the CSZ \(K\) matrix) are intentionally **not** included in this repository.

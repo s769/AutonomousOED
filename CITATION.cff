@@ -1,0 +1,32 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "AutonomousOED"
+type: software
+authors:
+  - family-names: Venkat
+    given-names: Sreeram
+  - family-names: Henneking
+    given-names: Stefan
+  - family-names: Ghattas
+    given-names: Omar
+repository-code: "https://github.com/s769/AutonomousOED"
+doi: 10.5281/zenodo.19701232
+license: MIT
+preferred-citation:
+  type: conference-paper
+  title: "Sensor placement for tsunami early warning via large-scale Bayesian optimal experimental design"
+  authors:
+    - family-names: Venkat
+      given-names: Sreeram
+    - family-names: Henneking
+      given-names: Stefan
+    - family-names: Ghattas
+      given-names: Omar
+  collection-title: "Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis"
+  collection-type: proceedings
+  conference:
+    name: "SC '26"
+  year: 2026
+  start: 234
+  end: 253
+  doi: 10.1109/SC51908.2026.00022
