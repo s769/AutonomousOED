@@ -226,6 +226,26 @@ def _load_doptimal_checkpoint_values(data):
     return data[:, 1]
 
 
+def _objective_from_file(path, budget):
+    """Read an objective value from a results file.
+
+    For a greedy checkpoint (one line per selected sensor) the cumulative
+    objective after ``budget`` sensors is returned, or the last line if the
+    file is shorter. For a single-value file the value itself is returned.
+    """
+    data = np.loadtxt(path)
+    if data.ndim == 2 and data.shape[1] >= 2 and np.all(data[:, 0] == np.round(data[:, 0])):
+        # "index objective [...]" lines, as written by select_sensors.py
+        values = data[:, 1]
+    else:
+        values = np.atleast_1d(_load_doptimal_checkpoint_values(data))
+    if values.size == 0:
+        raise ValueError(f"No objective values found in {path}")
+    if budget is not None and values.size >= budget:
+        return float(values[budget - 1])
+    return float(values[-1])
+
+
 def plot_histogram(checkpoint_file, optimal_value, uniform_value, budget, args):
     print("Generating plot...")
 
@@ -391,7 +411,27 @@ def main():
     parser.add_argument("--plot_only", action="store_true", help="Skip computation, just plot existing checkpoint file.")
     parser.add_argument("--no_plot", action="store_true", help="Skip plotting at the end.")
     parser.add_argument("--uniform_value", type=float, required=False, help="Uniform grid value of the D-optimal objective.")
+    parser.add_argument(
+        "--optimal_file",
+        type=str,
+        default=None,
+        help=(
+            "Checkpoint written by select_sensors.py (lines of 'index objective'). "
+            "The objective after --budget sensors is used as the optimal value."
+        ),
+    )
+    parser.add_argument(
+        "--uniform_file",
+        type=str,
+        default=None,
+        help="File written by evaluate_uniform_grid.py; its value is used as the uniform-grid value.",
+    )
     args = parser.parse_args()
+
+    if args.optimal_value is None and args.optimal_file:
+        args.optimal_value = _objective_from_file(args.optimal_file, args.budget)
+    if args.uniform_value is None and args.uniform_file:
+        args.uniform_value = _objective_from_file(args.uniform_file, None)
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()

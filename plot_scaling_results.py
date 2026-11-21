@@ -95,70 +95,35 @@ def add_efficiency_annotations(
             )
 
 
-def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=False):
+# Systems from the paper: file prefix -> (legend label, MPI ranks per node, colour index, marker).
+# Perlmutter: 1 rank per A100 (4 per node). Frontier: 1 rank per GCD, 2 GCDs per MI250X (8 per node).
+KNOWN_SYSTEMS = {
+    "pm": ("Perlmutter", 4, 0, "o"),
+    "fr": ("Frontier", 8, 3, "s"),
+}
+EXTRA_MARKERS = ["^", "D", "v", "P", "X"]
+
+
+def plot_scaling(systems, is_weak, out_filename, x_label, annotate=False):
+    """systems: list of dicts with keys label, color, marker, data (x_vals, wall_time)."""
+    systems = [s for s in systems if s["data"] is not None and len(s["data"]["x_vals"]) > 0]
+    if not systems:
+        print(f"No data for {out_filename}; skipping.")
+        return
+
     fig, ax = plt.subplots(figsize=(5, 4), dpi=300)
-
-    cb_palette = sns.color_palette("colorblind")
-    color_pm = cb_palette[0]
-    color_fr = cb_palette[3]
-
     all_x = set()
+    # In the paper the first system is annotated above its curve and the second below.
+    strong_offsets = [(0, 10), (0, -15)]
 
-    # Perlmutter
-    if pm_data is not None:
-        x_pm, wt_pm = pm_data["x_vals"], pm_data["wall_time"]
-        all_x.update(x_pm)
-        ax.plot(
-            x_pm,
-            wt_pm,
-            marker="o",
-            ms=9,
-            color=color_pm,
-            lw=3,
-            zorder=5,
-        )
-        ideal_pm = (
-            np.full_like(x_pm, wt_pm[0]) if is_weak else wt_pm[0] * (x_pm[0] / x_pm)
-        )
-        ax.plot(
-            x_pm,
-            ideal_pm,
-            ls="--",
-            color=color_pm,
-            lw=2,
-            alpha=0.8,
-            zorder=4,
-        )
+    for i, system in enumerate(systems):
+        x, wt = system["data"]["x_vals"], system["data"]["wall_time"]
+        all_x.update(x)
+        ax.plot(x, wt, marker=system["marker"], ms=9, color=system["color"], lw=3, zorder=5 + i)
+        ideal = np.full_like(x, wt[0]) if is_weak else wt[0] * (x[0] / x)
+        ax.plot(x, ideal, ls="--", color=system["color"], lw=2, alpha=0.8, zorder=4)
         if annotate and not is_weak:
-            add_efficiency_annotations(ax, x_pm, wt_pm, ideal_pm, offset=(0, 10))
-
-    # Frontier
-    if fr_data is not None:
-        x_fr, wt_fr = fr_data["x_vals"], fr_data["wall_time"]
-        all_x.update(x_fr)
-        ax.plot(
-            x_fr,
-            wt_fr,
-            marker="s",
-            ms=9,
-            color=color_fr,
-            lw=3,
-            zorder=6,
-        )
-        ideal_fr = (
-            np.full_like(x_fr, wt_fr[0]) if is_weak else wt_fr[0] * (x_fr[0] / x_fr)
-        )
-        ax.plot(
-            x_fr,
-            ideal_fr,
-            ls="--",
-            color=color_fr,
-            lw=2,
-            alpha=0.8,
-            zorder=4,
-        )
-        if annotate and not is_weak:
-            add_efficiency_annotations(ax, x_fr, wt_fr, ideal_fr, offset=(0, -15))
+            add_efficiency_annotations(ax, x, wt, ideal, offset=strong_offsets[i % 2])
 
     ax.set_xlabel(x_label, fontweight="bold")
     ax.set_ylabel("Wall Time (s)", fontweight="bold")
@@ -173,35 +138,24 @@ def plot_scaling(pm_data, fr_data, is_weak, out_filename, x_label, annotate=Fals
         ax.set_ylim(top=curr_top * 2)
     else:
         ax.set_ylim(bottom=0)
-        top_val = max(
-            [d["wall_time"].max() for d in [pm_data, fr_data] if d is not None]
-        )
+        top_val = max(s["data"]["wall_time"].max() for s in systems)
         ax.set_ylim(top=top_val * 1.25)
         if annotate:
             y_pad = top_val * 0.07
-            if pm_data is not None:
-                x_pm, wt_pm = pm_data["x_vals"], pm_data["wall_time"]
-                ideal_pm = np.full_like(x_pm, wt_pm[0])
+            for i, system in enumerate(systems):
+                x, wt = system["data"]["x_vals"], system["data"]["wall_time"]
                 add_efficiency_annotations(
-                    ax, x_pm, wt_pm, ideal_pm, y_offset_data=y_pad
-                )
-            if fr_data is not None:
-                x_fr, wt_fr = fr_data["x_vals"], fr_data["wall_time"]
-                ideal_fr = np.full_like(x_fr, wt_fr[0])
-                add_efficiency_annotations(
-                    ax, x_fr, wt_fr, ideal_fr, y_offset_data=-y_pad
+                    ax, x, wt, np.full_like(x, wt[0]), y_offset_data=y_pad if i % 2 == 0 else -y_pad
                 )
 
     if all_x:
         ax.set_xticks(sorted(list(all_x)))
 
-    # --- Separated Legend Logic ---
     custom_legend = [
-        Line2D([0], [0], color=color_pm, lw=3, marker="o", ms=8, label="Perlmutter"),
-        Line2D([0], [0], color=color_fr, lw=3, marker="s", ms=8, label="Frontier"),
-        # Line2D([0], [0], color="black", lw=3, linestyle="-", label="Observed"),
-        Line2D([0], [0], color="black", lw=2, linestyle="--", label="Ideal"),
+        Line2D([0], [0], color=s["color"], lw=3, marker=s["marker"], ms=8, label=s["label"])
+        for s in systems
     ]
+    custom_legend.append(Line2D([0], [0], color="black", lw=2, linestyle="--", label="Ideal"))
 
     ax.legend(
         handles=custom_legend, frameon=True, shadow=True, loc="lower left", fontsize=10
@@ -241,21 +195,109 @@ def plot_combined_scaling(
     fig.savefig(out_filename, format="pdf", bbox_inches="tight")
 
 
+def discover_systems(data_dir, kind):
+    """Map prefix -> path for every <prefix>_<kind>_scaling.csv in data_dir."""
+    suffix = f"_{kind}_scaling.csv"
+    found = {}
+    for name in sorted(os.listdir(data_dir)):
+        if name.endswith(suffix) and len(name) > len(suffix):
+            found[name[: -len(suffix)]] = os.path.join(data_dir, name)
+    return found
+
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description=(
+            "Plot strong/weak scaling from the CSVs written by run_scaling.sh. "
+            "Every <prefix>_strong_scaling.csv / <prefix>_weak_scaling.csv in --data_dir is plotted; "
+            "one system is enough."
+        )
+    )
     parser.add_argument("--annotate", action="store_true")
     parser.add_argument("--x_units", choices=["nodes", "gpus"], default="gpus")
+    parser.add_argument(
+        "--data_dir",
+        type=str,
+        default=None,
+        help="Directory with the scaling CSVs (default: current directory, else ./scaling_results).",
+    )
+    parser.add_argument("--outdir", type=str, default=None, help="Directory for the PDFs (default: --data_dir).")
+    parser.add_argument(
+        "--systems",
+        nargs="+",
+        default=None,
+        metavar="PREFIX[=LABEL]",
+        help=(
+            "File prefixes to plot, optionally with a legend label, e.g. --systems fr=Frontier. "
+            "Default: every prefix found. pm and fr are labelled Perlmutter and Frontier."
+        ),
+    )
+    parser.add_argument(
+        "--ranks_per_node",
+        type=int,
+        default=None,
+        help=(
+            "MPI ranks per node for prefixes other than pm (4) and fr (8); "
+            "also overrides those if given. Default for other prefixes: 4."
+        ),
+    )
+    parser.add_argument("--max_nodes", type=int, default=256, help="Largest node count to plot.")
     args = parser.parse_args()
 
     x_label = "Number of Compute Nodes" if args.x_units == "nodes" else "Number of GPUs"
 
-    # Perlmutter: 4 ranks/node. Frontier: 8 ranks/node.
-    pm_s = load_data("pm_strong_scaling.csv", 4, x_units=args.x_units)
-    fr_s = load_data("fr_strong_scaling.csv", 8, x_units=args.x_units)
-    pm_w = load_data("pm_weak_scaling.csv", 4, x_units=args.x_units)
-    fr_w = load_data("fr_weak_scaling.csv", 8, x_units=args.x_units)
+    data_dir = args.data_dir
+    if data_dir is None:
+        here = discover_systems(".", "strong") or discover_systems(".", "weak")
+        data_dir = "." if here or not os.path.isdir("scaling_results") else "scaling_results"
+    outdir = args.outdir or data_dir
+    os.makedirs(outdir, exist_ok=True)
 
-    plot_scaling(
-        pm_s, fr_s, False, "strong_scaling_walltime.pdf", x_label, args.annotate
-    )
-    plot_scaling(pm_w, fr_w, True, "weak_scaling_walltime.pdf", x_label, args.annotate)
+    strong_files = discover_systems(data_dir, "strong")
+    weak_files = discover_systems(data_dir, "weak")
+    prefixes = sorted(set(strong_files) | set(weak_files), key=lambda p: (p not in KNOWN_SYSTEMS, list(KNOWN_SYSTEMS).index(p) if p in KNOWN_SYSTEMS else p))
+    labels = {}
+    if args.systems:
+        wanted = []
+        for item in args.systems:
+            prefix, _, label = item.partition("=")
+            wanted.append(prefix)
+            if label:
+                labels[prefix] = label
+        unknown = [p for p in wanted if p not in prefixes]
+        if unknown:
+            parser.error(f"No scaling CSV found in {data_dir} for prefix(es): {', '.join(unknown)}")
+        prefixes = wanted
+    if not prefixes:
+        parser.error(
+            f"No *_strong_scaling.csv or *_weak_scaling.csv found in {data_dir}. "
+            "Use --data_dir to point at the output directory of run_scaling.sh."
+        )
+
+    cb_palette = sns.color_palette("colorblind")
+    used_colors = {KNOWN_SYSTEMS[p][2] for p in prefixes if p in KNOWN_SYSTEMS}
+    free_colors = [i for i in range(len(cb_palette)) if i not in used_colors]
+    strong, weak = [], []
+    n_extra = 0
+    for prefix in prefixes:
+        if prefix in KNOWN_SYSTEMS:
+            label, rpn, color_idx, marker = KNOWN_SYSTEMS[prefix]
+        else:
+            label, rpn = prefix, 4
+            color_idx = free_colors[n_extra % len(free_colors)]
+            marker = EXTRA_MARKERS[n_extra % len(EXTRA_MARKERS)]
+            n_extra += 1
+        label = labels.get(prefix, label)
+        if args.ranks_per_node is not None:
+            rpn = args.ranks_per_node
+        style = {"label": label, "color": cb_palette[color_idx], "marker": marker}
+        for files, target in ((strong_files, strong), (weak_files, weak)):
+            data = (
+                load_data(files[prefix], rpn, max_nodes=args.max_nodes, x_units=args.x_units)
+                if prefix in files
+                else None
+            )
+            target.append(dict(style, data=data))
+
+    plot_scaling(strong, False, os.path.join(outdir, "strong_scaling_walltime.pdf"), x_label, args.annotate)
+    plot_scaling(weak, True, os.path.join(outdir, "weak_scaling_walltime.pdf"), x_label, args.annotate)

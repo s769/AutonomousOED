@@ -16,6 +16,8 @@ Options:
   --start-ranks <N>          Starting ranks (default: 4)
   --ranks-per-node <N>       Used to estimate nodes for srun (default: 4)
   --extra-srun "<args...>"   Extra args passed to srun (default: "")
+  --prefix <name>            Prefix of the output CSVs, e.g. "fr" for Frontier
+                             (default: pm -> pm_strong_scaling.csv, pm_weak_scaling.csv)
 EOF
 }
 
@@ -28,6 +30,7 @@ START_RANKS=4
 RANKS_PER_NODE=4
 EXTRA_SRUN=""
 MAX_RANKS=""
+PREFIX="pm"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +43,7 @@ while [[ $# -gt 0 ]]; do
     --start-ranks) START_RANKS="$2"; shift 2 ;;
     --ranks-per-node) RANKS_PER_NODE="$2"; shift 2 ;;
     --extra-srun) EXTRA_SRUN="$2"; shift 2 ;;
+    --prefix) PREFIX="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown arg: $1"; usage; exit 2 ;;
   esac
@@ -71,7 +75,7 @@ for (( ranks=START_RANKS; ranks<=MAX_RANKS; ranks*=2 )); do
     fi
     srun -N "$nodes" -n "$ranks" -u $EXTRA_SRUN python scaling_benchmark.py \
         --h5_path "$H5_PATH" \
-        --file "$OUTDIR/pm_strong_scaling.csv" \
+        --file "$OUTDIR/${PREFIX}_strong_scaling.csv" \
         --total_candidates "$STRONG_TOTAL" \
         --runs "$RUNS" \
         --max_evals 0
@@ -94,7 +98,7 @@ for (( ranks=START_RANKS; ranks<=MAX_RANKS; ranks*=2 )); do
     fi
     srun -N "$nodes" -n "$ranks" -u $EXTRA_SRUN python scaling_benchmark.py \
         --h5_path "$H5_PATH" \
-        --file "$OUTDIR/pm_weak_scaling.csv" \
+        --file "$OUTDIR/${PREFIX}_weak_scaling.csv" \
         --total_candidates "$total_cand" \
         --runs "$RUNS"
 done
