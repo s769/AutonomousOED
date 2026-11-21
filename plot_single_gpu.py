@@ -6,27 +6,101 @@ from pathlib import Path
 import seaborn as sns
 import os
 import shutil
+import sys
+import argparse
 
 # ==========================================
-# 1. FILE CONFIGURATION
+# 1. INPUT FILES
 # ==========================================
-DATA_DIR = Path(__file__).resolve().parent / "scaling_results"
-FILE_A100 = DATA_DIR / "single_gpu_results_a100.csv"
-FILE_MI250X = DATA_DIR / "single_gpu_results_mi250x.csv"
-FILE_GH200 = DATA_DIR / "single_gpu_results_gh200.csv"
-FILE_GB200 = DATA_DIR / "single_gpu_results_gb200.csv"
-FILE_MI300X = DATA_DIR / "single_gpu_results_mi300x.csv"
+# Usage:
+#   python plot_single_gpu.py                      # every single_gpu_results_<gpu>.csv in ./scaling_results
+#   python plot_single_gpu.py results.csv          # one CSV written by single_gpu_benchmark.py
+#   python plot_single_gpu.py a.csv b.csv --labels MI250X A100
+#   python plot_single_gpu.py --data_dir my_runs --outdir figures
+DEFAULT_DATA_DIR = Path(__file__).resolve().parent / "scaling_results"
+RESULT_PATTERN = "single_gpu_results_*.csv"
+
+# Legend order and colours of the GPUs in the paper; any other label gets the next free colour.
+KNOWN_GPUS = ["MI250X", "A100", "GH200", "GB200", "MI300X"]
+KNOWN_COLOR_INDEX = {"MI250X": 1, "A100": 0, "GH200": 2, "GB200": 3, "MI300X": 4}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Plot single-GPU time per iteration (naive vs. Schur formulation)."
+    )
+    parser.add_argument(
+        "files",
+        nargs="*",
+        help=(
+            "CSV files written by single_gpu_benchmark.py. If none are given, every "
+            f"{RESULT_PATTERN} in --data_dir is plotted."
+        ),
+    )
+    parser.add_argument(
+        "--labels",
+        nargs="+",
+        default=None,
+        help="Legend label for each file, in order (default: taken from the file name).",
+    )
+    parser.add_argument(
+        "--data_dir",
+        type=Path,
+        default=None,
+        help=f"Directory searched for {RESULT_PATTERN} when no files are given (default: {DEFAULT_DATA_DIR}).",
+    )
+    parser.add_argument(
+        "--outdir",
+        type=Path,
+        default=None,
+        help="Directory for the two PDFs (default: the directory of the first input file).",
+    )
+    parser.add_argument(
+        "--no_tex",
+        action="store_true",
+        help="Do not use LaTeX for the labels even if it is installed.",
+    )
+    return parser.parse_args()
+
+
+def label_from_filename(path):
+    """single_gpu_results_mi250x.csv -> MI250X; anything else -> the file stem."""
+    stem = Path(path).stem
+    prefix = RESULT_PATTERN.split("*")[0]
+    return stem[len(prefix):].upper() if stem.startswith(prefix) and len(stem) > len(prefix) else stem
+
+
+def resolve_inputs(args):
+    """Return a list of (path, label), in legend order."""
+    if args.files:
+        files = [Path(f) for f in args.files]
+    else:
+        data_dir = args.data_dir or DEFAULT_DATA_DIR
+        files = sorted(data_dir.glob(RESULT_PATTERN))
+        if not files:
+            sys.exit(
+                f"No {RESULT_PATTERN} found in {data_dir}. Pass the CSV written by "
+                "single_gpu_benchmark.py, e.g.: python plot_single_gpu.py results.csv --labels MI250X"
+            )
+    missing = [str(f) for f in files if not f.exists()]
+    if missing:
+        sys.exit("File(s) not found: " + ", ".join(missing))
+    if args.labels is not None and len(args.labels) != len(files):
+        sys.exit(f"--labels needs one label per file ({len(files)} file(s), {len(args.labels)} label(s)).")
+    labels = args.labels or [label_from_filename(f) for f in files]
+    pairs = list(zip(files, labels))
+    if not args.files:  # auto-discovered: keep the paper's legend order
+        pairs.sort(key=lambda p: KNOWN_GPUS.index(p[1]) if p[1] in KNOWN_GPUS else len(KNOWN_GPUS))
+    return pairs
+
+
+ARGS = parse_args()
+INPUTS = resolve_inputs(ARGS)
+OUT_DIR = ARGS.outdir or INPUTS[0][0].resolve().parent
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
 TOP_RESERVE_FRAC = 0.08
 EXTEND_X_FRAC = 0.20
-
-LEGEND_SHORT_NAMES = {
-    "AMD MI250X": "MI250X",
-    "NVIDIA A100": "A100",
-    "NVIDIA GH200": "GH200",
-    "NVIDIA GB200": "GB200",
-    "NVIDIA MI300X": "MI300X",
-}
 
 # ==========================================
 # 2. PLOT STYLING & SETUP
@@ -47,7 +121,7 @@ def _ensure_latex_on_path():
 
 
 _ensure_latex_on_path()
-USE_TEX = shutil.which("latex") is not None
+USE_TEX = shutil.which("latex") is not None and not ARGS.no_tex
 
 plt.rcParams["text.usetex"] = False
 plt.rcParams["font.weight"] = "bold"
@@ -62,36 +136,35 @@ if USE_TEX:
     plt.rcParams["text.latex.preamble"] = r"\usepackage{amsmath}\usepackage{bm}"
 
 cb = sns.color_palette("colorblind")
-c_mi250 = cb[1]
-c_a100 = cb[0]
-c_gh200 = cb[2]
-c_gb200 = cb[3]
-c_mi300x = cb[4]
 c_theory = "#666666"
+
+
+def assign_colors(labels):
+    used = {KNOWN_COLOR_INDEX[l] for l in labels if l in KNOWN_COLOR_INDEX}
+    free = [i for i in range(len(cb)) if i not in used]
+    colors = []
+    for label in labels:
+        if label in KNOWN_COLOR_INDEX:
+            colors.append(cb[KNOWN_COLOR_INDEX[label]])
+        else:
+            colors.append(cb[free.pop(0) if free else len(colors) % len(cb)])
+    return colors
+
 
 fig_size = (5.0, 4.0)
 
 
 def load_data(filename):
-    if filename.exists():
-        return pd.read_csv(filename)
-    print(f"Warning: {filename} not found.")
-    return pd.DataFrame(
-        columns=["k", "time_N_OOP", "time_N_IP", "time_S_OOP", "time_S_IP"]
-    )
+    df = pd.read_csv(filename)
+    needed = {"k", "time_N_IP", "time_S_IP"}
+    if not needed.issubset(df.columns):
+        sys.exit(f"{filename} is missing column(s): {sorted(needed - set(df.columns))}")
+    return df
 
 
-df_mi250 = load_data(FILE_MI250X)
-df_a100 = load_data(FILE_A100)
-df_gh200 = load_data(FILE_GH200)
-df_gb200 = load_data(FILE_GB200)
-df_mi300x = load_data(FILE_MI300X)
+_colors = assign_colors([label for _, label in INPUTS])
 architectures = [
-    (df_mi250, c_mi250, "AMD MI250X"),
-    (df_a100, c_a100, "NVIDIA A100"),
-    (df_gh200, c_gh200, "NVIDIA GH200"),
-    (df_gb200, c_gb200, "NVIDIA GB200"),
-    (df_mi300x, c_mi300x, "NVIDIA MI300X"),
+    (load_data(path), color, label) for (path, label), color in zip(INPUTS, _colors)
 ]
 
 
@@ -109,7 +182,7 @@ def collect_finite_points(dfs, time_col):
 
 
 def legend_label(name):
-    return LEGEND_SHORT_NAMES.get(name, name)
+    return name
 
 
 def cm_bold_k_mathtext():
@@ -287,18 +360,31 @@ def plot_formulation(
     plt.close(fig)
 
 
-plot_formulation(
-    time_col="time_N_IP",
-    power=3,
-    theory_power_label=cm_bold_big_o(3),
-    output_file=str(DATA_DIR / "naive_performance.pdf"),
-)
+def make_plots():
+    plot_formulation(
+        time_col="time_N_IP",
+        power=3,
+        theory_power_label=cm_bold_big_o(3),
+        output_file=str(OUT_DIR / "naive_performance.pdf"),
+    )
+    plot_formulation(
+        time_col="time_S_IP",
+        power=2,
+        theory_power_label=cm_bold_big_o(2),
+        output_file=str(OUT_DIR / "schur_performance.pdf"),
+    )
 
-plot_formulation(
-    time_col="time_S_IP",
-    power=2,
-    theory_power_label=cm_bold_big_o(2),
-    output_file=str(DATA_DIR / "schur_performance.pdf"),
-)
 
-print("Generated naive_performance.pdf and schur_performance.pdf")
+try:
+    make_plots()
+except RuntimeError as err:
+    # An incomplete LaTeX installation is found on PATH but cannot typeset the labels.
+    if not USE_TEX:
+        raise
+    print("LaTeX could not render the labels; falling back to Matplotlib's mathtext.")
+    print(f"  ({str(err).splitlines()[0]})")
+    USE_TEX = False
+    plt.close("all")
+    make_plots()
+
+print(f"Generated naive_performance.pdf and schur_performance.pdf in {OUT_DIR}")

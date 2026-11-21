@@ -509,8 +509,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--timeline",
         type=str,
+        nargs="?",
+        const="io_overlap_timeline.json",
         default=None,
-        help="Write rank-0 pipelined overlap timeline JSON (recorded on the last run only).",
+        help=(
+            "Write rank-0 pipelined overlap timeline JSON (recorded on the last run only). "
+            "Optionally followed by the output path (default: io_overlap_timeline.json)."
+        ),
+    )
+    parser.add_argument(
+        "--trace_file",
+        type=str,
+        default=None,
+        help="Output path for the timeline JSON; same as giving the path to --timeline.",
     )
     parser.add_argument(
         "--timeline_record_from",
@@ -534,6 +545,10 @@ if __name__ == "__main__":
         help="Number of candidates in the overlap plot window.",
     )
     args = parser.parse_args()
+    # "--timeline out.json", "--timeline --trace_file out.json" and
+    # "--trace_file out.json" all record the timeline to out.json.
+    if args.trace_file is not None:
+        args.timeline = args.trace_file
 
     run_benchmark(
         args.file,

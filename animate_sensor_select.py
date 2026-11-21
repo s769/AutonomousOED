@@ -19,12 +19,12 @@ def parse_args():
     )
     parser.add_argument(
         "--sensors",
-        default="sens-mw-300-12x50-150-latlon.csv",
+        default="600_sensor_coords.csv",
         help="CSV of candidate sensor coordinates (columns: lon, lat).",
     )
     parser.add_argument(
         "--indices",
-        default="oed-200.txt",
+        default="cascadia_optimal_results.txt",
         help="Whitespace-separated file of selected sensor indices and objective values.",
     )
     return parser.parse_args()

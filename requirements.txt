@@ -1,8 +1,15 @@
-torch
-numpy
-mpi4py
-h5py
-tqdm
-matplotlib
-seaborn
-pandas
+# Versions used for the results in the paper (Python 3.11). Newer releases are
+# expected to work, but these are the ones the artifact was tested with.
+#
+# torch must be a GPU build that matches your system (CUDA or ROCm). A plain
+# "pip install torch" can give a CPU-only build, and the benchmarks then fail
+# because no GPU is detected. Install torch first, following your site's
+# instructions (see README.md), and then run: pip install -r requirements.txt
+torch==2.9.1
+numpy>=1.26,<3
+mpi4py>=3.1
+h5py>=3.10
+tqdm>=4.66
+matplotlib>=3.8
+seaborn>=0.13
+pandas>=2.1

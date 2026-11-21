@@ -5,6 +5,7 @@ import argparse
 import os
 import matplotlib.pyplot as plt
 import seaborn as sns
+from tqdm import tqdm
 
 # --- Standardized Styling ---
 sns.set_context("paper", font_scale=1.3)
@@ -23,38 +24,35 @@ def get_numpy_block(h5_dset, Nt, block_row_idx, block_col_idx):
     return block
 
 
-def build_k_submatrix(h5_dset, Nt, S_indices, device, dtype, r_sq=1.0):
-    """Builds the dense K_S submatrix for the selected sensors."""
-    current_size = len(S_indices) * Nt
-    K_S = torch.zeros((current_size, current_size), dtype=dtype, device=device)
+def fetch_block(h5_dset, Nt, row_sensor, col_sensor, device, dtype):
+    """Return the Nt x Nt block K[row_sensor, col_sensor] on the compute device.
 
-    print(f"Building {current_size}x{current_size} covariance matrix on {device}...")
-    
-    for row_idx, s_row in enumerate(S_indices):
-        for col_idx in range(row_idx, len(S_indices)):
-            s_col = S_indices[col_idx]
+    Only the upper triangle of K is read from disk; lower-triangle blocks are
+    the transposes of their mirror blocks.
+    """
+    fetch_row, fetch_col = min(row_sensor, col_sensor), max(row_sensor, col_sensor)
+    block = torch.from_numpy(get_numpy_block(h5_dset, Nt, fetch_row, fetch_col)).to(
+        device=device, dtype=dtype
+    )
+    if row_sensor > col_sensor:
+        block = block.T
+    return block
 
-            fetch_row, fetch_col = min(s_row, s_col), max(s_row, s_col)
-            block_np = get_numpy_block(h5_dset, Nt, fetch_row, fetch_col)
-            block = torch.from_numpy(block_np).to(device=device, dtype=dtype)
 
-            # Symmetrize diagonal blocks to prevent upstream float noise
-            if fetch_row == fetch_col:
-                block = 0.5 * (block + block.T)
+def solve_lower_blocked(L, K_Sc, k, Nt):
+    """Solve L[:k*Nt, :k*Nt] Y = K_Sc by block forward substitution, in place in K_Sc.
 
-            if s_row > s_col:
-                block = block.T
-
-            block.mul_(r_sq)
-            r_start, c_start = row_idx * Nt, col_idx * Nt
-
-            K_S[r_start : r_start + Nt, c_start : c_start + Nt] = block
-            if col_idx > row_idx:
-                K_S[c_start : c_start + Nt, r_start : r_start + Nt] = block.T
-
-    K_S.diagonal().add_(1.0)
-    return K_S
-
+    Each step uses one Nt x Nt triangular solve and one matrix product, so no
+    copy of the large factor is ever made.
+    """
+    for i in range(k):
+        r0, r1 = i * Nt, (i + 1) * Nt
+        if i > 0:
+            K_Sc[r0:r1] -= L[r0:r1, :r0] @ K_Sc[:r0]
+        K_Sc[r0:r1] = torch.linalg.solve_triangular(
+            L[r0:r1, r0:r1], K_Sc[r0:r1], upper=False
+        )
+    return K_Sc
 
 def uniform_subsample_indices(n_total, n_select):
     """Pick n_select evenly spaced indices from [0, n_total - 1].
@@ -95,13 +93,49 @@ def pick_center_fill_sensors(unselected, add_count, n_lon, n_lat):
 
 
 def evaluate_config(config, h5_dset, Nt, device, dtype, r_sq=1.0):
-    """Evaluate the D-optimal objective (log-det) of a configuration."""
-    K_S = build_k_submatrix(h5_dset, Nt, config, device, dtype, r_sq)
+    """Evaluate the D-optimal objective log det(I + r^2 K_S) of a configuration.
 
-    sign, logabsdet = torch.linalg.slogdet(K_S)
-    if sign <= 0:
-        return -np.inf
-    return logabsdet.item()
+    The Cholesky factor of I + r^2 K_S is built one sensor block at a time with
+    Schur-complement updates, as oed_hist.py does for the random configurations.
+    The dense matrix is never assembled or factorized in a single LAPACK call:
+    doing that (the previous slogdet) needs a second full-size copy on the GPU
+    and failed with a memory access fault on some ROCm installations.
+    Peak GPU memory is one (B*Nt) x (B*Nt) factor plus a few (B*Nt) x Nt blocks.
+    """
+    n = len(config)
+    size = n * Nt
+    print(f"Factorizing {size}x{size} covariance matrix block by block on {device}...")
+    L = torch.zeros((size, size), dtype=dtype, device=device)
+    log_det = 0.0
+
+    for k, c in enumerate(tqdm(config, desc="Sensors")):
+        r0, r1 = k * Nt, (k + 1) * Nt
+
+        K_cc = fetch_block(h5_dset, Nt, c, c, device, dtype)
+        K_cc = 0.5 * (K_cc + K_cc.T)  # symmetrize to remove upstream float noise
+        K_cc.mul_(r_sq).diagonal().add_(1.0)
+
+        if k > 0:
+            K_Sc = torch.empty((r0, Nt), dtype=dtype, device=device)
+            for i, s in enumerate(config[:k]):
+                K_Sc[i * Nt : (i + 1) * Nt] = fetch_block(h5_dset, Nt, s, c, device, dtype)
+            K_Sc.mul_(r_sq)
+
+            Y = solve_lower_blocked(L, K_Sc, k, Nt)
+            K_cc -= Y.T @ Y
+            L[r0:r1, :r0] = Y.T
+            del K_Sc, Y
+
+        try:
+            L_cc = torch.linalg.cholesky(K_cc)
+        except torch.linalg.LinAlgError:
+            print(f"Sensor {c} (position {k}) is numerically dependent on the previous ones.")
+            return -np.inf
+
+        L[r0:r1, r0:r1] = L_cc
+        log_det += 2.0 * torch.sum(torch.log(torch.diagonal(L_cc))).item()
+
+    return log_det
 
 
 def plot_grid_selection(coords_file, selected_indices, actual_budget):
@@ -149,21 +183,38 @@ def plot_grid_selection(coords_file, selected_indices, actual_budget):
 def main():
     parser = argparse.ArgumentParser(description="Evaluate an Exact-Budget Uniform Grid Subsample")
     parser.add_argument("--h5_store_K", type=str, required=True, help="Path to HDF5 K Matrix")
-    parser.add_argument("--coords_file", type=str, default="sensor_coords.csv", help="CSV for plotting")
+    parser.add_argument("--coords_file", type=str, default="600_sensor_coords.csv", help="CSV for plotting")
     parser.add_argument("--budget", type=int, default=175, help="Strict target budget (B)")
     parser.add_argument("--n_lat", type=int, default=50, help="Number of contiguous latitudes")
     parser.add_argument("--n_lon", type=int, default=12, help="Number of longitudes")
     parser.add_argument("--r_sq", type=float, default=1.0, help="Scaling factor r^2")
     parser.add_argument("--precision", type=str, choices=["single", "double"], default="single")
     parser.add_argument("--seed", type=int, default=42, help="Seed for deterministic add/drop")
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Compute device (auto: first GPU if one is visible, otherwise CPU)",
+    )
+    parser.add_argument(
+        "--output_file",
+        type=str,
+        default="uniform_result.txt",
+        help="Text file that receives the objective value (read by oed_hist.py --uniform_file)",
+    )
     
     args = parser.parse_args()
 
     # Hardware Setup
-    if torch.cuda.is_available():
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("Error: --device cuda was requested but PyTorch cannot see a GPU.")
+        return
+    if args.device != "cpu" and torch.cuda.is_available():
         device = torch.device("cuda:0")
     else:
         device = torch.device("cpu")
+    torch.set_grad_enabled(False)
 
     compute_dtype = torch.float64 if args.precision == "double" else torch.float32
 
@@ -247,6 +298,11 @@ def main():
     print(f"Final Network Size    : {len(selected_indices)} sensors")
     print(f"D-Optimal Objective   : {score:.6e}")
     print("="*40 + "\n")
+
+    if args.output_file:
+        with open(args.output_file, "w") as f:
+            f.write(f"{score:.18e}\n")
+        print(f"Objective value written to '{args.output_file}'")
 
     h5_file.close()
 

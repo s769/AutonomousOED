@@ -716,8 +716,13 @@ if __name__ == "__main__":
     parser.add_argument("--trace_file", type=str, default=None)
     parser.add_argument(
         "--timeline",
-        action="store_true",
-        help="Capture wall-clock overlap timeline (recommended for overlap plots)",
+        nargs="?",
+        const=True,
+        default=False,
+        help=(
+            "Capture wall-clock overlap timeline (recommended for overlap plots). "
+            "May be followed by the output JSON path, which is the same as --trace_file."
+        ),
     )
     parser.add_argument(
         "--start_candidate",
@@ -765,6 +770,11 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+    # Accept "--timeline out.json" as well as "--timeline --trace_file out.json".
+    if isinstance(args.timeline, str):
+        if args.trace_file is None:
+            args.trace_file = args.timeline
+        args.timeline = True
     start_candidate = args.start_candidate
     if args.focus_candidate is not None:
         start_candidate = args.focus_candidate
