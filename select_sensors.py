@@ -15,8 +15,10 @@ import numpy as np
 from mpi4py import MPI
 from tqdm import tqdm
 import argparse
+import json
 import math
 import sys
+import time
 
 from cuda_device import resolve_local_rank, resolve_torch_device
 from h5_batch_io import build_si_read_plan, load_ii_block, load_si_column_blocks
@@ -34,6 +36,22 @@ class LineTqdm(tqdm):
             flush()
 
         return write
+
+
+def _write_demo_progress(checkpoint_file, k, budget, phase, order=None):
+    """Sidecar JSON so the demo UI is not stuck behind srun stdout buffering."""
+    if not checkpoint_file:
+        return
+    path = checkpoint_file + ".progress.json"
+    tmp = path + ".tmp"
+    payload = {"k": int(k), "budget": int(budget), "phase": phase}
+    if order is not None:
+        payload["order"] = [int(x) for x in order]
+    with open(tmp, "w") as f:
+        json.dump(payload, f)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
 
 
 # solve_triangular copies a non-contiguous view of L_S. That copy grows with
@@ -123,7 +141,38 @@ def main():
     parser.add_argument(
         "--precision", type=str, choices=["single", "double"], default="single"
     )
+    parser.add_argument(
+        "--objective",
+        type=str,
+        default="doptimal",
+        help="Greedy objective. This tree supports doptimal only.",
+    )
+    parser.add_argument(
+        "--exclude_file",
+        type=str,
+        default=None,
+        help=(
+            "Text file of sensor indices (one per line or first column) to "
+            "exclude from the candidate set. Used for deployment-restriction "
+            "demos / repair runs. Excluded indices already in --restart_from "
+            "are dropped from the restart prefix."
+        ),
+    )
+    parser.add_argument(
+        "--wait_for_go",
+        type=str,
+        default=None,
+        help=(
+            "After loading K and rebuilding the retained Cholesky factor, "
+            "block until this file exists, then run the greedy loop. Used by "
+            "the demo to split prepare vs selection."
+        ),
+    )
     args = parser.parse_args()
+    n_at_rebuild = 0
+    t_sel0 = None
+    if args.objective != "doptimal":
+        raise ValueError("This tree only supports --objective doptimal")
 
     comm = MPI.COMM_WORLD
     rank = comm.Get_rank()
@@ -170,6 +219,15 @@ def main():
     S_indices = []
     log_dets = []
     current_log_det = 0.0
+    exclude_set = set()
+    if args.exclude_file:
+        raw = np.loadtxt(args.exclude_file)
+        if raw.ndim == 0:
+            exclude_set = {int(raw)}
+        elif raw.ndim == 1:
+            exclude_set = {int(x) for x in raw.tolist()}
+        else:
+            exclude_set = {int(x) for x in raw[:, 0].tolist()}
 
     # --- GLOBAL PRE-ALLOCATION ---
     max_size = args.budget * Nt
@@ -254,16 +312,41 @@ def main():
                     loaded = loaded.reshape(1, -1)
                 S_indices = loaded[:, 0].astype(int).tolist()
                 log_dets = loaded[:, 1].tolist()
-                print(f"Loaded {len(S_indices)} sensors.")
+                if exclude_set:
+                    kept = [
+                        (s, f)
+                        for s, f in zip(S_indices, log_dets)
+                        if int(s) not in exclude_set
+                    ]
+                    n_drop = len(S_indices) - len(kept)
+                    S_indices = [s for s, _ in kept]
+                    log_dets = [f for _, f in kept]
+                    print(
+                        f"Loaded {len(S_indices) + n_drop} sensors; "
+                        f"dropped {n_drop} excluded → keep {len(S_indices)} "
+                        "(repair mode: scores after drop may be stale until "
+                        "next append)."
+                    )
+                else:
+                    print(f"Loaded {len(S_indices)} sensors.")
             except Exception as e:
                 print(f"Restart failed: {e}. Starting fresh.")
                 S_indices = []
 
     S_indices = comm.bcast(S_indices, root=0)
 
+    if args.wait_for_go and rank == 0:
+        _write_demo_progress(
+            args.checkpoint_file,
+            len(S_indices),
+            args.budget,
+            "preparing",
+            order=S_indices,
+        )
+
     if len(S_indices) > 0:
         if rank == 0:
-            print("Rebuilding Cholesky factor...")
+            print("Rebuilding Cholesky factor...", flush=True)
         K_S_rebuilt = build_k_submatrix_from_h5(
             h5_dset, Nt, S_indices, device, args.r_sq, compute_dtype
         )
@@ -276,8 +359,57 @@ def main():
         current_log_det = 2 * torch.sum(torch.log(torch.diag(L_S)))
         del K_S_rebuilt
         torch.cuda.empty_cache()
+        if rank == 0:
+            cur = float(
+                current_log_det.item()
+                if torch.is_tensor(current_log_det)
+                else current_log_det
+            )
+            log_dets = [cur] * len(S_indices)
+            print("Cholesky rebuild finished.", flush=True)
 
+    # All ranks finish the rebuild above before rank 0 advertises ready.
+    if args.wait_for_go:
+        comm.Barrier()
+
+    n_at_rebuild = len(S_indices)
+    if args.wait_for_go:
+        if rank == 0:
+            print("DEMO_PHASE=ready", flush=True)
+            print(
+                f"READY_FOR_SELECTION n={n_at_rebuild} waiting on {args.wait_for_go}",
+                flush=True,
+            )
+            _write_demo_progress(
+                args.checkpoint_file,
+                n_at_rebuild,
+                args.budget,
+                "ready",
+                order=S_indices,
+            )
+            while not os.path.isfile(args.wait_for_go):
+                time.sleep(0.05)
+            print("DEMO_PHASE=selecting", flush=True)
+            print("GO received — starting selection", flush=True)
+            _write_demo_progress(
+                args.checkpoint_file,
+                n_at_rebuild,
+                args.budget,
+                "selecting",
+                order=S_indices,
+            )
+        comm.Barrier()
+
+    t_sel0 = time.time()
     if rank == 0:
+        if not args.wait_for_go:
+            _write_demo_progress(
+                args.checkpoint_file,
+                len(S_indices),
+                args.budget,
+                "selecting",
+                order=S_indices,
+            )
         pbar = LineTqdm(
             total=args.budget,
             initial=len(S_indices),
@@ -291,7 +423,9 @@ def main():
     try:
         for k in range(len(S_indices), args.budget):
             valid_candidates = [
-                i for i in local_candidate_indices if i not in S_indices
+                i
+                for i in local_candidate_indices
+                if i not in S_indices and i not in exclude_set
             ]
             actual_evals = len(valid_candidates)
 
@@ -524,6 +658,15 @@ def main():
 
             if rank == 0:
                 pbar.update(1)
+                n_now = k + 1
+                print("PROGRESS %d/%d" % (n_now, args.budget), flush=True)
+                _write_demo_progress(
+                    args.checkpoint_file,
+                    n_now,
+                    args.budget,
+                    "selecting",
+                    order=S_indices,
+                )
                 log_dets.append(
                     current_log_det.item()
                     if torch.is_tensor(current_log_det)
@@ -559,6 +702,23 @@ def main():
                 save_arr = np.array(list(zip(S_indices, log_dets)), dtype="d")
                 np.savetxt(args.checkpoint_file, save_arr, fmt="%d %.18e")
                 print(f"Saved {len(S_indices)} sensors to {args.checkpoint_file}")
+            if t_sel0 is not None:
+                sel_s = time.time() - t_sel0
+                n_start = int(n_at_rebuild)
+                n_new = max(0, len(S_indices) - n_start)
+                timing = {
+                    "selection_seconds": round(sel_s, 2),
+                    "n_start": n_start,
+                    "n_end": int(len(S_indices)),
+                    "n_new": int(n_new),
+                }
+                tfile = args.checkpoint_file + ".timing.json"
+                with open(tfile, "w") as tf:
+                    json.dump(timing, tf, indent=2)
+                print(
+                    f"DEMO_SELECTION_SECONDS={sel_s:.2f} DEMO_N_NEW={n_new}",
+                    flush=True,
+                )
 
 
 if __name__ == "__main__":

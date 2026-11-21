@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cascadia OED</title>
+  <link rel="stylesheet" href="vendor/leaflet.css" />
+  <link rel="stylesheet" href="style.css?v=live5" />
+</head>
+<body>
+  <header>
+    <div class="brand">Cascadia OED</div>
+    <div id="status" class="status">Loading…</div>
+    <div class="header-actions">
+      <button id="btnPresent" type="button" class="ghost">Full screen</button>
+      <button id="btnResetAll" type="button" class="ghost">Reset</button>
+    </div>
+  </header>
+
+  <main>
+    <div class="map-wrap">
+      <div id="map"></div>
+      <div class="credit">Esri World Imagery</div>
+    </div>
+    <aside>
+      <p class="lede">Wave-propagation operators live in <code>K</code>. Design reuses that matrix — it does not re-solve the physics.</p>
+
+      <div class="row gpu-row">
+        <label for="gpuCount">GPUs for selection</label>
+        <input id="gpuCount" type="number" min="1" step="1" placeholder="all" style="width:5em">
+        <span id="gpuMax" class="hint"></span>
+      </div>
+
+      <section id="stageA" class="stage current">
+        <h2>1 · Reference network</h2>
+        <p class="hint">Greedy D-opt from empty → 175 on the held GPU allocation.</p>
+        <button id="btnFull" type="button" class="primary wide">Compute 175</button>
+        <div class="row split">
+          <button id="btnFullPrepare" type="button">Load K</button>
+          <button id="btnFullSelect" type="button" class="primary" disabled>Start selection</button>
+        </div>
+        <button id="btnFullCancel" type="button" class="wide" hidden disabled>Stop</button>
+        <p id="fullHeadline" class="consequence" hidden></p>
+        <div id="fullProgress" class="repair-progress" hidden>
+          <div class="progress-meta">
+            <span id="fullStep">Starting…</span>
+            <span id="fullElapsed">0s</span>
+          </div>
+          <div class="bar"><div id="fullBar"></div></div>
+          <pre id="fullLog" class="log"></pre>
+        </div>
+        <div class="row">
+          <button id="btnPlay" type="button">Playback</button>
+          <button id="btnPause" type="button" disabled>Pause</button>
+          <button id="btnJump" type="button">Jump 175</button>
+        </div>
+        <label class="slider-label">Sensors <span id="kLabel">0</span> / <span id="kMax">175</span></label>
+        <input id="kSlider" type="range" min="0" max="175" value="0" />
+        <div class="uq-box" id="uqBox">
+          <div class="uq-head">
+            <span class="uq-title">Displacement σ</span>
+            <span id="meanStd" class="uq-mean">—</span>
+          </div>
+          <div class="colorbar" aria-hidden="true"></div>
+          <div class="colorbar-scale">
+            <span id="cmin">low</span>
+            <span id="cmax">high</span>
+          </div>
+          <p id="uqHide" class="note" hidden>No matching raster for this sensor set.</p>
+        </div>
+      </section>
+
+      <section id="stageB" class="stage">
+        <h2>2 · Deployment restriction</h2>
+        <div id="scenarioButtons" class="stack"></div>
+        <p id="consequence" class="consequence" hidden></p>
+      </section>
+
+      <section id="stageC" class="stage">
+        <h2>3 · Repair</h2>
+        <p class="hint">Keep every feasible site; greedy D-opt fill back to 175.</p>
+        <button id="btnRepair" type="button" class="primary wide" disabled>Repair network</button>
+        <div class="row split">
+          <button id="btnPrepare" type="button" disabled>Load &amp; factorize</button>
+          <button id="btnSelect" type="button" class="primary" disabled>Start selection</button>
+        </div>
+        <button id="btnCancel" type="button" class="wide" hidden disabled>Stop repair</button>
+        <p id="repairHeadline" class="consequence" hidden></p>
+        <div id="repairProgress" class="repair-progress" hidden>
+          <div class="progress-meta">
+            <span id="repairStep">Starting…</span>
+            <span id="repairElapsed">0s</span>
+          </div>
+          <div class="bar"><div id="repairBar"></div></div>
+          <pre id="repairLog" class="log"></pre>
+        </div>
+        <div class="compare" id="compareRow" hidden>
+          <button id="btnOrig" type="button">Original</button>
+          <button id="btnRemainder" type="button">Remainder</button>
+          <button id="btnRepaired" type="button" class="active">Repaired</button>
+        </div>
+        <dl class="metrics" id="repairMetrics" hidden>
+          <div><dt>Retained</dt><dd id="retainedCount">—</dd></div>
+          <div><dt>Replacements</dt><dd id="replacedCount">—</dd></div>
+          <div><dt>Remainder f(S)</dt><dd id="relRem">—</dd></div>
+          <div><dt>Repaired f(S)</dt><dd id="relOrig">—</dd></div>
+          <div><dt>Recovered</dt><dd id="recovered">—</dd></div>
+        </dl>
+        <p id="origNote" class="note" hidden>Original 175 is the unconstrained greedy reference — infeasible under this exclusion.</p>
+        <p id="precomputedNote" class="note" hidden></p>
+      </section>
+
+      <section class="legend-box">
+        <h2>Legend</h2>
+        <div class="legend"><span class="swatch orig"></span> Original selected</div>
+        <div class="legend"><span class="swatch ret"></span> Retained</div>
+        <div class="legend"><span class="swatch neu"></span> Replacement</div>
+        <div class="legend"><span class="mark">×</span> Lost to the restriction</div>
+        <div class="legend"><span class="swatch forb"></span> Unavailable candidates</div>
+      </section>
+    </aside>
+  </main>
+
+  <script>
+    window.DEMO_DATA_URL = window.DEMO_DATA_URL || "/data";
+  </script>
+  <script src="vendor/leaflet.js"></script>
+  <script src="app.js?v=live5"></script>
+</body>
+</html>
